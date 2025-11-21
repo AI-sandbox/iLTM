@@ -1,0 +1,106 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools_scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "iltm"
+version = "0.1.0"
+description = "iLTM: Integrated Large Tabular Model"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [
+    {name = "David Bonet"},
+    {name = "Marçal Comajoan Cara"},
+    {name = "Alvaro Calafell"},
+    {name = "Daniel Mas Montserrat"},
+    {name = "Alexander G. Ioannidis"},
+]
+keywords = [
+    "machine-learning",
+    "tabular-data",
+    "meta-learning",
+    "hypernetwork",
+    "classification",
+    "regression",
+    "ensemble",
+    "scikit-learn",
+    "pytorch",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "catboost>=1.2.8",
+    "numpy>=2.3.3",
+    "openml>=0.15.1",
+    "pandas>=2.3.3",
+    "scikit-learn>=1.6",
+    "torch>=2.8.0",
+    "xgboost>=3.0.5",
+    "huggingface_hub>=0.20",
+]
+
+[project.urls]
+Homepage = "https://github.com/AI-sandbox/iLTM"
+Repository = "https://github.com/AI-sandbox/iLTM"
+Documentation = "https://github.com/AI-sandbox/iLTM#readme"
+"Hugging Face" = "https://huggingface.co/dbonet/iLTM"
+Issues = "https://github.com/AI-sandbox/iLTM/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "tox>=4.0",
+    "optuna>=3.0.0",
+]
+all = [
+    "iltm[dev]",
+]
+
+[tool.uv]
+environments = ["python_full_version < '3.14'"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["iltm*"]
+
+[tool.setuptools_scm]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+
+[tool.tox]
+requires = ["tox>=4.0", "tox-gh-actions"]
+legacy_tox_ini = """
+[tox]
+envlist = py311, py312, py313
+# Use TOX_WORK_DIR if set (for CI), otherwise default to .tox under the project
+toxworkdir = {env:TOX_WORK_DIR:{tox_root}/.tox}
+
+[gh-actions]
+python =
+    3.11: py311
+    3.12: py312
+    3.13: py313
+
+[testenv]
+package = editable-legacy
+deps =
+    pytest>=7.0
+setenv =
+    ILTM_CKPT_DIR = {env:ILTM_CKPT_DIR:{env:HOME}{/}.cache{/}iltm}
+    PIP_NO_CACHE_DIR = 1
+commands =
+    pytest tests/ -v
+"""
