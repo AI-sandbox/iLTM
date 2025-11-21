@@ -133,19 +133,16 @@ pytest tests/
 ```
 
 ## Citation
-
-If you use iLTM in your research, please cite our paper:
+If you use iLTM in your research, please cite our [paper](https://arxiv.org/abs/2511.15941):
 
 ```bibtex
-@article{iltm2025,
+@article{bonet2025iltm,
   title={iLTM: Integrated Large Tabular Model},
-  author={Bonet, David and Comajoan Cara, Marçal and Calafell, Alvaro and Mas Montserrat, Daniel and Ioannidis, Alexander G.},
-  journal={arXiv preprint},
-  year={2025}
+  author={Bonet, David and Comajoan Cara, Marçal and Calafell, Alvaro and Mas Montserrat, Daniel and Ioannidis, Alexander G},
+  journal={arXiv preprint arXiv:2511.15941},
+  year={2025},
 }
 ```
-
-*Note: update with the actual publication details once available.*
 
 ## License
 

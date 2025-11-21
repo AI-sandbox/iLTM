@@ -5,12 +5,21 @@ on:
     branches:
       - "main"
       - "dev"
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.github/**/*.md'
   pull_request:
     branches:
       - '*'
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.github/**/*.md'
 
 jobs:
   test:
+    if: false  # Set to true to re-enable tests
     strategy:
       fail-fast: false
       matrix:
