@@ -1,6 +1,6 @@
 # iLTM: Integrated Large Tabular Model
 
-[![PyPI version](https://badge.fury.io/py/iltm.svg)](https://badge.fury.io/py/iltm)
+[![PyPI](https://img.shields.io/pypi/v/iltm.svg?color=green)](https://pypi.org/project/iltm)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/AI-sandbox/iLTM/blob/main/LICENSE)
 [![Downloads](https://img.shields.io/pypi/dm/iltm)](https://pypistats.org/packages/iltm)
 [![Python Versions](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](https://pypi.org/project/iltm/)
@@ -11,7 +11,7 @@ iLTM is a foundation model for tabular data that integrates tree-derived embeddi
 
 We release open weights of pre-trained model checkpoints that consistently achieve superior performance across tabular classification and regression tasks, from small to large and high-dimensional tasks.
 
-![iLTM architecture diagram](iltm-diagram.svg)
+![iLTM architecture diagram](https://github.com/AI-sandbox/iLTM/raw/main/iltm-diagram.svg)
 
 ### Install
 
@@ -123,12 +123,10 @@ The specification format is intentionally minimal so that it can be re-used in a
 
 ## Development
 
-### Running Tests
-
 To run the tests:
 
 ```bash
-uv pip install -e ".[dev]"
+pip install -e ".[dev]"
 pytest tests/
 ```
 
@@ -146,4 +144,4 @@ If you use iLTM in your research, please cite our [paper](https://arxiv.org/abs/
 
 ## License
 
-© Contributors, 2025. Licensed under an [Apache-2](https://github.com/AI-sandbox/iLTM/blob/main/LICENSE) license.
+© Contributors, 2025. Licensed under the [Apache-2.0](https://github.com/AI-sandbox/iLTM/blob/main/LICENSE) license.
