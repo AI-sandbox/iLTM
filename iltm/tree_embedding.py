@@ -53,7 +53,7 @@ class TreeEmbedding:
                 Range: [1, 50] (recommended for both CatBoost and XGBoost).
             subsample (float): Fraction of samples to be used for fitting the tree-based model. Default is None (use default parameters in specific tree model).
             feature_fraction (float): Fraction of features to be used for fitting the tree-based model. Default is None (use default parameters in specific tree model).
-            device (str): Device to use for training ('gpu' or 'cpu').
+            device (str): Compute device: 'cpu', or 'cuda'/'cuda:N'/'gpu'/'gpu:N' for GPU (XGBoost/CatBoost only).
             select_best_model (bool): Whether to select the best model based on the validation set. Default is True.
             eval_size (float): Fraction of data to use for validation.
             use_default_params (bool): Whether to use default parameters for the tree-based model. Will override any other parameters that are set.
@@ -116,6 +116,33 @@ class TreeEmbedding:
                     self.n_estimators, self.max_depth
                 )
                 self.max_depth = min(self.max_depth, 7)
+
+    def _is_gpu_device(self) -> bool:
+        device = str(self.device).lower()
+        return device == 'gpu' or device.startswith('gpu:') or device == 'cuda' or device.startswith('cuda:')
+
+    def _xgboost_device(self) -> str:
+        if not self._is_gpu_device():
+            return 'cpu'
+
+        device = str(self.device).lower()
+        if device.startswith('cuda'):
+            return device
+        if device.startswith('gpu:'):
+            return f"cuda:{device.split(':', 1)[1]}"
+        return 'cuda'
+
+    def _catboost_task_type(self) -> str:
+        return 'GPU' if self._is_gpu_device() else 'CPU'
+
+    def _catboost_devices(self) -> str:
+        if not self._is_gpu_device():
+            return ''
+
+        device = str(self.device).lower()
+        if ':' in device:
+            return device.split(':', 1)[1]
+        return '0'
 
 
     def _handle_categorical_features(self, X: pd.DataFrame | np.ndarray) -> pd.DataFrame:
@@ -316,7 +343,7 @@ class TreeEmbedding:
             params = {
                 'tree_method': 'hist' if self.tree_model == 'XGBoost_hist' else 'approx',
                 'seed': self.seed,
-                'device': 'gpu' if self.device == 'gpu' else 'cpu',
+                'device': self._xgboost_device(),
                 'n_jobs': -1
             }
             if self.task_type == 'regression':
@@ -341,6 +368,11 @@ class TreeEmbedding:
             if self.l2_leaf_reg is not None:
                 params['reg_lambda'] = self.l2_leaf_reg
 
+            logger.debug(
+                "XGBoost %s: requested device=%s, resolved device=%s",
+                self.tree_model, self.device, params['device'],
+            )
+
             # conservative max_bin when VRAM is tight
             info = get_gpu_memory_info()
             if info and info["free_mb"] < 1024:
@@ -362,6 +394,7 @@ class TreeEmbedding:
 
             for attempt in range(1, max_attempts + 1):
                 try:
+                    logger.debug("XGBoost %s: training attempt %d on device=%s", self.tree_model, attempt, params['device'])
                     self.model = xgb.train(
                         params=params,
                         dtrain=dtrain,
@@ -400,9 +433,10 @@ class TreeEmbedding:
                         num_rounds = max(50, num_rounds // 2)
                         continue
 
-                    if params['device'] == 'gpu':
+                    if str(params['device']).startswith('cuda'):
                         logger.warning("XGBoost OOM persists. Falling back to CPU.")
                         params['device'] = 'cpu'
+                        logger.debug("XGBoost %s: falling back to device=cpu", self.tree_model)
                         continue
 
                     raise
@@ -415,8 +449,8 @@ class TreeEmbedding:
 
         elif self.tree_model == 'CatBoost':
             catboost_params = {
-                'task_type': "GPU" if self.device == 'gpu' else "CPU",
-                'devices': '0' if self.device == 'gpu' else '',
+                'task_type': self._catboost_task_type(),
+                'devices': self._catboost_devices(),
                 'random_seed': self.seed,
                 'verbose': 0,
                 'thread_count': -1
@@ -448,7 +482,7 @@ class TreeEmbedding:
                 catboost_params['subsample'] = self.subsample
 
             if self.feature_fraction is not None and self.feature_fraction < 1.0:
-                if self.device == 'gpu':
+                if self._is_gpu_device():
                     logger.debug("CatBoost: feature_fraction (rsm) < 1.0 is not supported on GPU. "
                                    "Ignoring feature_fraction to stay on GPU. Effective feature_fraction will be 1.0.")
                 else: # device is 'cpu'
@@ -463,6 +497,14 @@ class TreeEmbedding:
                     catboost_params['task_type'] = 'CPU'
                     catboost_params.pop('devices', None)
                     catboost_params.pop('gpu_ram_part', None)
+                    logger.debug("CatBoost: low VRAM fallback to task_type=CPU")
+
+            logger.debug(
+                "CatBoost: requested device=%s, resolved task_type=%s, devices=%s",
+                self.device,
+                catboost_params['task_type'],
+                catboost_params.get('devices', ''),
+            )
 
             if self.task_type == 'regression':
                 ctor = CatBoostRegressor
@@ -486,6 +528,12 @@ class TreeEmbedding:
 
             for attempt in range(1, max_attempts + 1):
                 try:
+                    logger.debug(
+                        "CatBoost: training attempt %d on task_type=%s, devices=%s",
+                        attempt,
+                        catboost_params['task_type'],
+                        catboost_params.get('devices', ''),
+                    )
                     self.model = ctor(**catboost_params)
                     if eval_pool is not None:
                         self.model.fit(train_pool, eval_set=eval_pool, use_best_model=True, early_stopping_rounds=100)
@@ -530,6 +578,7 @@ class TreeEmbedding:
                         catboost_params['task_type'] = 'CPU'
                         catboost_params.pop('devices', None)
                         catboost_params.pop('gpu_ram_part', None)
+                        logger.debug("CatBoost: OOM fallback to task_type=CPU")
                         continue
 
                     # If we are already on CPU and still OOM, rethrow
