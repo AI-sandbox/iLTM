@@ -53,7 +53,7 @@ class TreeEmbedding:
                 Range: [1, 50] (recommended for both CatBoost and XGBoost).
             subsample (float): Fraction of samples to be used for fitting the tree-based model. Default is None (use default parameters in specific tree model).
             feature_fraction (float): Fraction of features to be used for fitting the tree-based model. Default is None (use default parameters in specific tree model).
-            device (str): Device to use for training ('gpu' or 'cpu').
+            device (str): Compute device: 'cpu', or 'cuda'/'cuda:N'/'gpu'/'gpu:N' for GPU (XGBoost/CatBoost only).
             select_best_model (bool): Whether to select the best model based on the validation set. Default is True.
             eval_size (float): Fraction of data to use for validation.
             use_default_params (bool): Whether to use default parameters for the tree-based model. Will override any other parameters that are set.
