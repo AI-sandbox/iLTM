@@ -117,6 +117,33 @@ class TreeEmbedding:
                 )
                 self.max_depth = min(self.max_depth, 7)
 
+    def _is_gpu_device(self) -> bool:
+        device = str(self.device).lower()
+        return device == 'gpu' or device.startswith('gpu:') or device == 'cuda' or device.startswith('cuda:')
+
+    def _xgboost_device(self) -> str:
+        if not self._is_gpu_device():
+            return 'cpu'
+
+        device = str(self.device).lower()
+        if device.startswith('cuda'):
+            return device
+        if device.startswith('gpu:'):
+            return f"cuda:{device.split(':', 1)[1]}"
+        return 'cuda'
+
+    def _catboost_task_type(self) -> str:
+        return 'GPU' if self._is_gpu_device() else 'CPU'
+
+    def _catboost_devices(self) -> str:
+        if not self._is_gpu_device():
+            return ''
+
+        device = str(self.device).lower()
+        if ':' in device:
+            return device.split(':', 1)[1]
+        return '0'
+
 
     def _handle_categorical_features(self, X: pd.DataFrame | np.ndarray) -> pd.DataFrame:
         """
@@ -316,7 +343,7 @@ class TreeEmbedding:
             params = {
                 'tree_method': 'hist' if self.tree_model == 'XGBoost_hist' else 'approx',
                 'seed': self.seed,
-                'device': 'gpu' if self.device == 'gpu' else 'cpu',
+                'device': self._xgboost_device(),
                 'n_jobs': -1
             }
             if self.task_type == 'regression':
@@ -400,7 +427,7 @@ class TreeEmbedding:
                         num_rounds = max(50, num_rounds // 2)
                         continue
 
-                    if params['device'] == 'gpu':
+                    if str(params['device']).startswith('cuda'):
                         logger.warning("XGBoost OOM persists. Falling back to CPU.")
                         params['device'] = 'cpu'
                         continue
@@ -415,8 +442,8 @@ class TreeEmbedding:
 
         elif self.tree_model == 'CatBoost':
             catboost_params = {
-                'task_type': "GPU" if self.device == 'gpu' else "CPU",
-                'devices': '0' if self.device == 'gpu' else '',
+                'task_type': self._catboost_task_type(),
+                'devices': self._catboost_devices(),
                 'random_seed': self.seed,
                 'verbose': 0,
                 'thread_count': -1
@@ -448,7 +475,7 @@ class TreeEmbedding:
                 catboost_params['subsample'] = self.subsample
 
             if self.feature_fraction is not None and self.feature_fraction < 1.0:
-                if self.device == 'gpu':
+                if self._is_gpu_device():
                     logger.debug("CatBoost: feature_fraction (rsm) < 1.0 is not supported on GPU. "
                                    "Ignoring feature_fraction to stay on GPU. Effective feature_fraction will be 1.0.")
                 else: # device is 'cpu'
