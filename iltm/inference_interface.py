@@ -648,6 +648,52 @@ class _iLTMBase(BaseEstimator):
         elif 'device' in params and isinstance(params['device'], torch.device):
             params['device'] = str(params['device'])
         return params
+
+    def __getstate__(self):
+        """Exclude the pretrained model from serialized estimators."""
+        try:
+            state = super().__getstate__().copy()
+        except AttributeError:
+            state = self.__dict__.copy()
+        model = state.get("_model")
+        if model is not None:
+            state["_inference_model_config_"] = {
+                "pca_sampling": getattr(model, "pca_sampling", self.pca_sampling),
+                "n_dims": getattr(model, "n_dims", self.n_dims),
+                "clip_data_value": getattr(model, "clip_data_value", self.clip_data_value),
+            }
+        state["_model"] = None
+        return state
+
+    def _get_inference_model_config(self) -> dict[str, Any]:
+        """Return the compact model settings needed by fitted predictors."""
+        config = getattr(self, "_inference_model_config_", None)
+        if config is not None:
+            return config
+
+        model = getattr(self, "_model", None)
+        return {
+            "pca_sampling": getattr(model, "pca_sampling", self.pca_sampling),
+            "n_dims": getattr(model, "n_dims", self.n_dims),
+            "clip_data_value": getattr(model, "clip_data_value", self.clip_data_value),
+        }
+
+    def _release_training_model(self) -> None:
+        """Release the pretrained model after predictor generation."""
+        model = getattr(self, "_model", None)
+        if model is None:
+            return
+
+        self._inference_model_config_ = self._get_inference_model_config()
+        self._model = None
+
+        if any(cached_model is model for cached_model in self._model_cache.values()):
+            model.to("cpu")
+
+        del model
+        gc.collect()
+        if self.device.type == "cuda":
+            clear_cuda_cache()
     
     @property
     def device(self):
@@ -678,7 +724,9 @@ class _iLTMBase(BaseEstimator):
         )
         cache_key = (self.model_path, str(self.device)) + arch_params
         if cache_key in self._model_cache:
-            return self._model_cache[cache_key]
+            model = self._model_cache[cache_key].to(self.device)
+            model.eval()
+            return model
 
         model = iLTM(
             n_dims=self.n_dims,
@@ -1393,7 +1441,7 @@ class _iLTMBase(BaseEstimator):
                 loader = torch.utils.data.DataLoader(ds, batch_size=bs, shuffle=False)
                 for (Xb,) in loader:
                     Xb = Xb.to(self.device)
-                    model_cfg = vars(self._model)
+                    model_cfg = self._get_inference_model_config()
                     out = full_main_forward(
                         Xb,
                         n_outputs,
@@ -1515,6 +1563,11 @@ class _iLTMBase(BaseEstimator):
             raise ValueError("checkpoint must be provided.")
         self.model_path = self.checkpoint or self.model_path
         self._model = self._initialize_model()
+        self._inference_model_config_ = {
+            "pca_sampling": self._model.pca_sampling,
+            "n_dims": self._model.n_dims,
+            "clip_data_value": self._model.clip_data_value,
+        }
 
         # TreeEmbedding creation
         self.tr_ = None
@@ -1795,6 +1848,7 @@ class _iLTMBase(BaseEstimator):
         if fit_deadline:
             remaining = fit_deadline - fit_end_time
             logger.debug(f"_fit_common END: remaining time={remaining:.2f}s, fit_duration={fit_duration:.2f}s" if fit_duration else f"_fit_common END: remaining time={remaining:.2f}s")
+        self._release_training_model()
         logger.info(f"{len(self.predictors_)} predictors generated. Model fitted and ready for inference.")
         return self
 
