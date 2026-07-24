@@ -67,7 +67,7 @@ class CustomOneHotPipeline(BaseEstimator, TransformerMixin):
         self.cat_features = cat_features
         self.max_cat_size = max_cat_size
 
-    def fit(self, X, y=None):
+    def _fit_transform(self, X):
         X = pd.DataFrame(X)
 
         # Map column indices to column names
@@ -119,11 +119,20 @@ class CustomOneHotPipeline(BaseEstimator, TransformerMixin):
         
         # Initialize the ColumnTransformer with the specified transformers
         self.tfm_ = ColumnTransformer(transformers=transformers)
-        self.tfm_.fit(X)
+        transformed = self.tfm_.fit_transform(X)
         # mark fitted for sklearn checks
         self.is_fitted_ = True
         self.n_features_in_ = X.shape[1]
+        return transformed
+
+    def fit(self, X, y=None):
+        self._fit_transform(X)
         return self
+
+    def fit_transform(self, X, y=None, **fit_params):
+        if fit_params:
+            return super().fit_transform(X, y, **fit_params)
+        return self._fit_transform(X)
 
     def transform(self, X, y=None):
         X = pd.DataFrame(X)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import iltm.inference_interface as inference_interface
 from iltm import iLTMClassifier
@@ -41,7 +42,19 @@ def test_fit_transform_reuses_training_pipeline_output(monkeypatch):
 
     pipeline.fit_transform(_mixed_frame())
 
-    assert calls == [4]
+    assert calls == []
+
+
+def test_inner_fit_transform_params_fail_without_partial_fit():
+    pipeline = CustomOneHotPipeline([])
+
+    with pytest.raises(TypeError, match="sample_weight"):
+        pipeline.fit_transform(
+            np.ones((3, 2), dtype=np.float32),
+            sample_weight=np.ones(3),
+        )
+
+    assert not hasattr(pipeline, "tfm_")
 
 
 def test_fit_transform_matches_fit_then_transform():
