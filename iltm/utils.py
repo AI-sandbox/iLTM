@@ -772,14 +772,33 @@ def fine_tune_main_network(
             base += f" [cooldown {cd}]"
         return base
 
+    def implicit_patience_in_checks(num_batches_epoch, interval_batches):
+        checks_per_epoch = max(1, num_batches_epoch // interval_batches)
+        if (
+            max_train_batches_per_epoch is None
+            or max_train_batches_per_epoch >= num_batches_epoch
+        ):
+            return max(1, int(patience_epochs * checks_per_epoch))
+
+        # Round up to the first validation after the capped patience window.
+        return max(
+            1,
+            math.ceil(
+                patience_epochs
+                * max_train_batches_per_epoch
+                / interval_batches
+            ),
+        )
+
     # Translate early stopping tolerance into checks when in batch mode
     if mode == "batch":
-        checks_per_epoch = max(1, num_batches_full_epoch // val_interval_batches)
         if patience_checks is not None:
             patience_in_checks = int(patience_checks)
         else:
-            # default: patience_epochs worth of checks
-            patience_in_checks = max(1, int(patience_epochs * checks_per_epoch))
+            patience_in_checks = implicit_patience_in_checks(
+                num_batches_full_epoch,
+                val_interval_batches,
+            )
     else:
         patience_in_checks = None  # not used
 
@@ -946,9 +965,11 @@ def fine_tune_main_network(
             if num_batches_epoch > max(4, val_checks_per_epoch_target):
                 val_interval_batches = max(1, num_batches_epoch // max(1, val_checks_per_epoch_target))
                 # also refresh patience_in_checks to match new checks/epoch
-                checks_per_epoch = max(1, num_batches_epoch // val_interval_batches)
                 if patience_checks is None:
-                    patience_in_checks = max(1, int(patience_epochs * checks_per_epoch))
+                    patience_in_checks = implicit_patience_in_checks(
+                        num_batches_epoch,
+                        val_interval_batches,
+                    )
 
         batches_run_this_epoch = 0
         for it, (inputs, targets) in enumerate(train_loader):
