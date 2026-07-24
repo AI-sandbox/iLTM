@@ -146,8 +146,16 @@ class RobustScaleSmoothClipTransform(BaseEstimator, TransformerMixin):
 
         # NaN-aware statistics across samples (axis -2 == 0 for 2D)
         med = np.nanmedian(X, axis=-2)
-        q75 = np.nanquantile(X, 0.75, axis=-2)
-        q25 = np.nanquantile(X, 0.25, axis=-2)
+        if X.shape[0] == 0 or X.shape[1] == 0:
+            q75 = np.nanquantile(X, 0.75, axis=-2)
+            q25 = np.nanquantile(X, 0.25, axis=-2)
+        else:
+            quantiles = np.nanquantile(X, [0.25, 0.75], axis=-2)
+            if np.issubdtype(X.dtype, np.floating) and X.dtype.itemsize < 8:
+                # Vector quantiles promote float16/float32 to float64, unlike
+                # scalar quantiles. Preserve the existing rounding behavior.
+                quantiles = quantiles.astype(X.dtype, copy=False)
+            q25, q75 = quantiles
         iqr = q75 - q25
 
         # fallback width when IQR is zero or NaN
