@@ -784,6 +784,62 @@ class _iLTMBase(BaseEstimator):
     # -----------------------------
     # Preprocessing
     # -----------------------------
+    @staticmethod
+    def _concatenate_original_and_tree_features(
+        X_original: np.ndarray | pd.DataFrame,
+        X_embeddings: np.ndarray,
+    ) -> pd.DataFrame:
+        """Combine original and tree-derived features while preserving dtypes."""
+        if X_original.shape[0] != X_embeddings.shape[0]:
+            raise ValueError(
+                "Original and tree features have inconsistent sample counts: "
+                f"{X_original.shape[0]} != {X_embeddings.shape[0]}."
+            )
+
+        if isinstance(X_original, pd.DataFrame):
+            index = X_original.index
+            original = X_original.copy(deep=False)
+        else:
+            index = pd.RangeIndex(X_original.shape[0])
+            original = pd.DataFrame(X_original, index=index, copy=False)
+
+        n_original = original.shape[1]
+        original.columns = pd.RangeIndex(n_original)
+        embeddings = pd.DataFrame(
+            X_embeddings,
+            index=index,
+            columns=pd.RangeIndex(n_original, n_original + X_embeddings.shape[1]),
+            copy=False,
+        )
+        return pd.concat([original, embeddings], axis=1)
+
+    @staticmethod
+    def _combine_preprocessed_columns(
+        x_num: np.ndarray,
+        x_cat: np.ndarray,
+        selected_indices: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Combine split preprocessing output, materializing only selected columns."""
+        if selected_indices is None:
+            return np.concatenate([x_num, x_cat], axis=1)
+
+        selected_indices = np.asarray(selected_indices, dtype=np.intp)
+        n_num = x_num.shape[1]
+        n_features = n_num + x_cat.shape[1]
+        if np.any(selected_indices < 0) or np.any(selected_indices >= n_features):
+            raise IndexError("Selected feature index is out of bounds.")
+
+        dtype = np.result_type(x_num.dtype, x_cat.dtype)
+        selected = np.empty((x_num.shape[0], selected_indices.size), dtype=dtype)
+        num_mask = selected_indices < n_num
+        if np.any(num_mask):
+            selected[:, num_mask] = x_num[:, selected_indices[num_mask]]
+        if np.any(~num_mask):
+            selected[:, ~num_mask] = x_cat[
+                :, selected_indices[~num_mask] - n_num
+            ]
+        return selected
+
     def _preprocess_fitting_data(
         self,
         x: np.ndarray | pd.DataFrame,
@@ -896,8 +952,6 @@ class _iLTMBase(BaseEstimator):
                 x_num[np.isnan(x_num)] = 0
                 x_cat[np.isnan(x_cat)] = 0
 
-            x = np.concatenate([x_num, x_cat], axis=1)
-
         elif self.preprocessing == 'none' or self.preprocessing is None:
             logger.debug("Not preprocessing data")
             x, y = check_X_y(x, y)
@@ -914,13 +968,34 @@ class _iLTMBase(BaseEstimator):
             y = np.array(y, dtype=np.float32)
 
         # Correlation-based feature selection (posneg_topk strategy)
-        if self.corr_select_k > 0 and x.shape[1] > self.corr_select_k:
+        if self.preprocessing == 'realmlp_td_s_v0':
+            n_preprocessed_features = x_num.shape[1] + x_cat.shape[1]
+        else:
+            n_preprocessed_features = x.shape[1]
+
+        if self.corr_select_k > 0 and n_preprocessed_features > self.corr_select_k:
             logger.debug(f"Applying correlation-based feature selection: selecting up to {self.corr_select_k} features using posneg_topk strategy (only non-zero correlations)")
-            r = compute_feature_target_correlations(x, y)
+            if self.preprocessing == 'realmlp_td_s_v0':
+                correlations = []
+                for columns in (x_num, x_cat):
+                    if columns.shape[1]:
+                        correlations.append(
+                            compute_feature_target_correlations(columns, y)
+                        )
+                r = np.concatenate(correlations)
+            else:
+                r = compute_feature_target_correlations(x, y)
             selected_indices = select_top_correlated_features(r, self.corr_select_k)
-            x = x[:, selected_indices]
+            if self.preprocessing == 'realmlp_td_s_v0':
+                x = self._combine_preprocessed_columns(
+                    x_num, x_cat, selected_indices
+                )
+            else:
+                x = x[:, selected_indices]
             preprocessing_objects['corr_selected_indices'] = selected_indices
         else:
+            if self.preprocessing == 'realmlp_td_s_v0':
+                x = self._combine_preprocessed_columns(x_num, x_cat)
             preprocessing_objects['corr_selected_indices'] = None
 
         return x, y, preprocessing_objects
@@ -929,7 +1004,8 @@ class _iLTMBase(BaseEstimator):
         logger.debug(f"Preprocessing test data x_test {np.shape(x_test)} with type: {self.preprocessing}")
         if not isinstance(x_test, (np.ndarray, pd.DataFrame)):
             x_test = check_array(x_test)
-        x_test = np.array(x_test)
+        if self.preprocessing != 'realmlp_td_s_v0':
+            x_test = np.array(x_test)
 
         if self.preprocessing == 'minimal':
             if len(x_test.shape) == 1:
@@ -950,7 +1026,7 @@ class _iLTMBase(BaseEstimator):
             x_test = preprocessing_objects['scaler'].transform(x_test)
 
         elif self.preprocessing == 'realmlp_td_s_v0':
-            x_df = pd.DataFrame(x_test)
+            x_df = pd.DataFrame(x_test, copy=False)
             x_df.columns = range(x_df.shape[1])
             x_df = standardize_column_dtypes(x_df)
             x_num, x_cat = preprocessing_objects['pipeline'].transform(x_df)
@@ -964,7 +1040,11 @@ class _iLTMBase(BaseEstimator):
                 x_num[np.isnan(x_num)] = 0
                 x_cat[np.isnan(x_cat)] = 0
 
-            x_test = np.concatenate([x_num, x_cat], axis=1)
+            x_test = self._combine_preprocessed_columns(
+                x_num,
+                x_cat,
+                preprocessing_objects.get('corr_selected_indices'),
+            )
 
         elif self.preprocessing == 'none' or self.preprocessing is None:
             x_test = np.array(x_test)
@@ -973,7 +1053,10 @@ class _iLTMBase(BaseEstimator):
             raise ValueError(f"Invalid preprocessing type: {self.preprocessing}")
 
         # Apply correlation-based feature selection if used during training
-        if preprocessing_objects.get('corr_selected_indices') is not None:
+        if (
+            self.preprocessing != 'realmlp_td_s_v0'
+            and preprocessing_objects.get('corr_selected_indices') is not None
+        ):
             selected_indices = preprocessing_objects['corr_selected_indices']
             x_test = x_test[:, selected_indices]
 
@@ -1512,7 +1595,9 @@ class _iLTMBase(BaseEstimator):
                         X_for_nn = X_for_nn.iloc[:, :self.tr_.n_orig_features_to_keep_]  # type: ignore[union-attr]
                     else:
                         X_for_nn = X_for_nn[:, :self.tr_.n_orig_features_to_keep_]  # type: ignore[union-attr]
-                X_work = np.concatenate([X_for_nn, X_emb_train], axis=1)
+                X_work = self._concatenate_original_and_tree_features(
+                    X_for_nn, X_emb_train
+                )
                 if X_val_original is not None and X_emb_val is not None:
                     X_val_work = X_val_original
                     if self.tr_.n_orig_features_to_keep_ is not None:  # type: ignore[union-attr]
@@ -1520,7 +1605,9 @@ class _iLTMBase(BaseEstimator):
                             X_val_work = X_val_work.iloc[:, :self.tr_.n_orig_features_to_keep_]  # type: ignore[union-attr]
                         else:
                             X_val_work = X_val_work[:, :self.tr_.n_orig_features_to_keep_]  # type: ignore[union-attr]
-                    X_val_work = np.concatenate([X_val_work, X_emb_val], axis=1)
+                    X_val_work = self._concatenate_original_and_tree_features(
+                        X_val_work, X_emb_val
+                    )
                 else:
                     X_val_work = None
             else:
@@ -1616,7 +1703,9 @@ class _iLTMBase(BaseEstimator):
                             X_for_nn = X_for_nn.iloc[:, :self.tr_[i].n_orig_features_to_keep_]
                         else:
                             X_for_nn = X_for_nn[:, :self.tr_[i].n_orig_features_to_keep_]
-                    X_fit = np.concatenate([X_for_nn, X_emb_tr], axis=1)
+                    X_fit = self._concatenate_original_and_tree_features(
+                        X_for_nn, X_emb_tr
+                    )
                     if X_val_original is not None and X_emb_val is not None:
                         X_val_work = X_val_original
                         if self.tr_[i].n_orig_features_to_keep_ is not None:
@@ -1624,7 +1713,9 @@ class _iLTMBase(BaseEstimator):
                                 X_val_work = X_val_work.iloc[:, :self.tr_[i].n_orig_features_to_keep_]
                             else:
                                 X_val_work = X_val_work[:, :self.tr_[i].n_orig_features_to_keep_]
-                        X_val_fit = np.concatenate([X_val_work, X_emb_val], axis=1)
+                        X_val_fit = self._concatenate_original_and_tree_features(
+                            X_val_work, X_emb_val
+                        )
                     else:
                         X_val_fit = None
                 else:
@@ -1720,7 +1811,9 @@ class _iLTMBase(BaseEstimator):
                         X_original = X_original.iloc[:, :self.tr_.n_orig_features_to_keep_]  # type: ignore[union-attr]
                     else:
                         X_original = X_original[:, :self.tr_.n_orig_features_to_keep_]  # type: ignore[union-attr]
-                X_work = np.concatenate([X_original, X_emb], axis=1)
+                X_work = self._concatenate_original_and_tree_features(
+                    X_original, X_emb
+                )
             else:
                 X_work = X_emb
         else:
@@ -1770,7 +1863,9 @@ class _iLTMBase(BaseEstimator):
                                     X_batch_base = X_batch_base.iloc[:, :self.tr_[i].n_orig_features_to_keep_]
                                 else:
                                     X_batch_base = X_batch_base[:, :self.tr_[i].n_orig_features_to_keep_]
-                            X_batch = np.concatenate([X_batch_base, X_emb], axis=1)
+                            X_batch = self._concatenate_original_and_tree_features(
+                                X_batch_base, X_emb
+                            )
                         else:
                             X_batch = X_emb
 
@@ -2245,7 +2340,9 @@ class iLTMClassifier(_iLTMBase, ClassifierMixin, PermutationImportanceMixin):
                                         X_base = X_base.iloc[:, :self.tr_[i].n_orig_features_to_keep_]
                                     else:
                                         X_base = X_base[:, :self.tr_[i].n_orig_features_to_keep_]
-                                X_batch = np.concatenate([X_base, X_emb], axis=1)
+                                X_batch = self._concatenate_original_and_tree_features(
+                                    X_base, X_emb
+                                )
                             else:
                                 X_batch = X_emb
                             X_tensor = self._preprocess_test_data(X_batch, self.preprocessors_[i])

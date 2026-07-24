@@ -1109,9 +1109,12 @@ def check_stratification(y, stratify, task_type):
 
 def standardize_column_dtypes(df: pd.DataFrame) -> pd.DataFrame:
     for column in df.columns:
-        # Convert all entries to strings if the column contains mixed data types
-        if df[column].apply(type).nunique() > 1:  # This checks if more than one type is present in the column
-            df[column] = df[column].astype(str)  # Convert all entries to strings
+        column_dtype = df[column].dtype
+        if not (
+            pd.api.types.is_numeric_dtype(column_dtype)
+            or pd.api.types.is_bool_dtype(column_dtype)
+        ) and df[column].apply(type).nunique() > 1:
+            df[column] = df[column].astype(str)
         # bool to category
         if df[column].dtype == 'bool':
             df[column] = df[column].astype('category')
@@ -1521,6 +1524,9 @@ def clear_cuda_cache() -> None:
 
 
 
+_CORRELATION_WORKING_SET_BYTES = 256 * 1024**2
+
+
 def compute_feature_target_correlations(X: np.ndarray, y: np.ndarray) -> np.ndarray:
     """
     Compute Pearson correlation coefficient between each feature and the target.
@@ -1542,21 +1548,35 @@ def compute_feature_target_correlations(X: np.ndarray, y: np.ndarray) -> np.ndar
         Pearson correlation coefficients for each feature, shape (n_features,).
         Values are in [-1, 1] with NaN/inf replaced by 0.0.
     """
-    X = np.asarray(X, dtype=float)
+    X = np.asarray(X)
     y = np.asarray(y, dtype=float)
-    
-    X_centered = X - X.mean(axis=0, keepdims=True)
+
+    if X.ndim != 2:
+        raise ValueError(f"X must be two-dimensional, got shape {X.shape!r}.")
+    if X.shape[0] != y.shape[0]:
+        raise ValueError(
+            f"X and y have inconsistent sample counts: {X.shape[0]} != {y.shape[0]}."
+        )
+
     y_centered = y - y.mean()
-    
-    numerator = (X_centered * y_centered.reshape(-1, 1)).sum(axis=0)
-    
-    X_std = np.sqrt((X_centered**2).sum(axis=0))
     y_std = np.sqrt((y_centered**2).sum())
-    denominator = X_std * y_std
-    
-    denominator[denominator == 0] = np.inf
-    
-    correlations = numerator / denominator
+
+    bytes_per_float = np.dtype(float).itemsize
+    chunk_size = max(
+        1,
+        _CORRELATION_WORKING_SET_BYTES // max(1, X.shape[0] * bytes_per_float),
+    )
+    correlations = np.empty(X.shape[1], dtype=float)
+    for start in range(0, X.shape[1], chunk_size):
+        end = min(start + chunk_size, X.shape[1])
+        X_chunk = np.asarray(X[:, start:end], dtype=float)
+        X_centered = X_chunk - X_chunk.mean(axis=0, keepdims=True)
+        numerator = (X_centered * y_centered.reshape(-1, 1)).sum(axis=0)
+        X_std = np.sqrt((X_centered**2).sum(axis=0))
+        denominator = X_std * y_std
+        denominator[denominator == 0] = np.inf
+        correlations[start:end] = numerator / denominator
+
     correlations = np.clip(correlations, -1.0, 1.0)
     correlations = np.nan_to_num(correlations, nan=0.0, posinf=0.0, neginf=0.0)
     
