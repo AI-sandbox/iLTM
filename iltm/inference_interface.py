@@ -1239,8 +1239,28 @@ class _iLTMBase(BaseEstimator):
 
         return self._move_predictor_to_cpu(predictor)
 
-    def _forward_pass_predictor(self, predictor: dict, X: Tensor | Dict[str, Tensor], n_outputs: int) -> Tensor:
-        predictor = self._move_predictor_to_device(predictor, device=self.device)
+    def _forward_pass_predictor(
+        self,
+        predictor: dict,
+        X: Tensor | Dict[str, Tensor],
+        n_outputs: int,
+        *,
+        manage_predictor_device: bool = True,
+    ) -> Tensor:
+        if manage_predictor_device:
+            try:
+                predictor = self._move_predictor_to_device(
+                    predictor,
+                    device=self.device,
+                )
+                return self._forward_pass_predictor(
+                    predictor,
+                    X,
+                    n_outputs,
+                    manage_predictor_device=False,
+                )
+            finally:
+                self._move_predictor_to_cpu(predictor)
 
         feature_bagging_idxs = predictor['feature_bagging_idxs']
         rf = predictor['rf']
@@ -1308,7 +1328,6 @@ class _iLTMBase(BaseEstimator):
                 logger.warning("CUDA OOM during inference forward. Reducing batch size %d -> %d", bs, new_bs)
                 bs = new_bs
 
-        predictor = self._move_predictor_to_cpu(predictor)
         return torch.cat(outs, dim=0)
 
 
@@ -1730,26 +1749,38 @@ class _iLTMBase(BaseEstimator):
                     chunk_rows = 10000
 
                 outs_chunks: List[Tensor] = []
-                for start in range(0, n_samples, chunk_rows):
-                    end = min(start + chunk_rows, n_samples)
-                    X_batch_orig = X_original.iloc[start:end] if isinstance(X_original, pd.DataFrame) else X_original[start:end]
-                    X_emb = self.tr_[i].transform(X_batch_orig)
-                    if self.concat_tree_with_orig_features:
-                        X_batch_base = X_batch_orig
-                        if self.tr_[i].n_orig_features_to_keep_ is not None:
-                            if isinstance(X_batch_base, pd.DataFrame):
-                                X_batch_base = X_batch_base.iloc[:, :self.tr_[i].n_orig_features_to_keep_]
-                            else:
-                                X_batch_base = X_batch_base[:, :self.tr_[i].n_orig_features_to_keep_]
-                        X_batch = np.concatenate([X_batch_base, X_emb], axis=1)
-                    else:
-                        X_batch = X_emb
+                try:
+                    predictor = self._move_predictor_to_device(
+                        predictor,
+                        device=self.device,
+                    )
+                    for start in range(0, n_samples, chunk_rows):
+                        end = min(start + chunk_rows, n_samples)
+                        X_batch_orig = X_original.iloc[start:end] if isinstance(X_original, pd.DataFrame) else X_original[start:end]
+                        X_emb = self.tr_[i].transform(X_batch_orig)
+                        if self.concat_tree_with_orig_features:
+                            X_batch_base = X_batch_orig
+                            if self.tr_[i].n_orig_features_to_keep_ is not None:
+                                if isinstance(X_batch_base, pd.DataFrame):
+                                    X_batch_base = X_batch_base.iloc[:, :self.tr_[i].n_orig_features_to_keep_]
+                                else:
+                                    X_batch_base = X_batch_base[:, :self.tr_[i].n_orig_features_to_keep_]
+                            X_batch = np.concatenate([X_batch_base, X_emb], axis=1)
+                        else:
+                            X_batch = X_emb
 
-                    X_tensor = self._preprocess_test_data(X_batch, self.preprocessors_[i])
-                    out = self._forward_pass_predictor(predictor, X_tensor, n_outputs=n_outputs)
-                    if softmax_per_predictor:
-                        out = F.softmax(out, dim=1)
-                    outs_chunks.append(out)
+                        X_tensor = self._preprocess_test_data(X_batch, self.preprocessors_[i])
+                        out = self._forward_pass_predictor(
+                            predictor,
+                            X_tensor,
+                            n_outputs=n_outputs,
+                            manage_predictor_device=False,
+                        )
+                        if softmax_per_predictor:
+                            out = F.softmax(out, dim=1)
+                        outs_chunks.append(out)
+                finally:
+                    self._move_predictor_to_cpu(predictor)
 
                 outputs = torch.cat(outs_chunks, dim=0)
             else:
@@ -2193,23 +2224,35 @@ class iLTMClassifier(_iLTMBase, ClassifierMixin, PermutationImportanceMixin):
                     except Exception:
                         chunk_rows = 10000
                     pred_labels_chunks: List[Tensor] = []
-                    for start in range(0, n_samples, chunk_rows):
-                        end = min(start + chunk_rows, n_samples)
-                        X_batch_orig = X.iloc[start:end] if isinstance(X, pd.DataFrame) else X[start:end]
-                        X_emb = self.tr_[i].transform(X_batch_orig)
-                        if self.concat_tree_with_orig_features:
-                            X_base = X_batch_orig
-                            if self.tr_[i].n_orig_features_to_keep_ is not None:
-                                if isinstance(X_base, pd.DataFrame):
-                                    X_base = X_base.iloc[:, :self.tr_[i].n_orig_features_to_keep_]
-                                else:
-                                    X_base = X_base[:, :self.tr_[i].n_orig_features_to_keep_]
-                            X_batch = np.concatenate([X_base, X_emb], axis=1)
-                        else:
-                            X_batch = X_emb
-                        X_tensor = self._preprocess_test_data(X_batch, self.preprocessors_[i])
-                        logits = self._forward_pass_predictor(predictor, X_tensor, n_outputs=self.n_outputs_)
-                        pred_labels_chunks.append(torch.argmax(logits, dim=1))
+                    try:
+                        predictor = self._move_predictor_to_device(
+                            predictor,
+                            device=self.device,
+                        )
+                        for start in range(0, n_samples, chunk_rows):
+                            end = min(start + chunk_rows, n_samples)
+                            X_batch_orig = X.iloc[start:end] if isinstance(X, pd.DataFrame) else X[start:end]
+                            X_emb = self.tr_[i].transform(X_batch_orig)
+                            if self.concat_tree_with_orig_features:
+                                X_base = X_batch_orig
+                                if self.tr_[i].n_orig_features_to_keep_ is not None:
+                                    if isinstance(X_base, pd.DataFrame):
+                                        X_base = X_base.iloc[:, :self.tr_[i].n_orig_features_to_keep_]
+                                    else:
+                                        X_base = X_base[:, :self.tr_[i].n_orig_features_to_keep_]
+                                X_batch = np.concatenate([X_base, X_emb], axis=1)
+                            else:
+                                X_batch = X_emb
+                            X_tensor = self._preprocess_test_data(X_batch, self.preprocessors_[i])
+                            logits = self._forward_pass_predictor(
+                                predictor,
+                                X_tensor,
+                                n_outputs=self.n_outputs_,
+                                manage_predictor_device=False,
+                            )
+                            pred_labels_chunks.append(torch.argmax(logits, dim=1))
+                    finally:
+                        self._move_predictor_to_cpu(predictor)
                     pred_labels = torch.cat(pred_labels_chunks, dim=0)
                 else:
                     logits = self._forward_pass_predictor(predictor, preprocessed_once, n_outputs=self.n_outputs_)  # type: ignore[arg-type]
