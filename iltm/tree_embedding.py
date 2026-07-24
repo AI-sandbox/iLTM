@@ -471,7 +471,8 @@ class TreeEmbedding:
                 'devices': self._catboost_devices(),
                 'random_seed': self.seed,
                 'verbose': 0,
-                'thread_count': -1
+                'thread_count': -1,
+                'allow_writing_files': False,
             }
             if self.n_estimators is not None:
                 catboost_params['iterations'] = self.n_estimators
