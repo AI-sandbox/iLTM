@@ -615,8 +615,7 @@ def fine_tune_main_network(
     step_times = deque(maxlen=50)
     avg_step_time = None
 
-    def validate_model():
-        main_model.eval()
+    def _evaluate_validation_metric():
         val_loss = 0
         val_targets = []
         val_outputs = []
@@ -657,6 +656,14 @@ def fine_tune_main_network(
 
         # val_metric_name == 'LogLoss'
         return val_loss, val_loss
+
+    def validate_model():
+        was_training = main_model.training
+        main_model.eval()
+        try:
+            return _evaluate_validation_metric()
+        finally:
+            main_model.train(was_training)
 
     if isinstance(X, dict):
         X_num = X['x_num']
@@ -1051,6 +1058,7 @@ def fine_tune_main_network(
     )
     weights_to_load = es["best_model_wts"]
     main_model.load_state_dict(weights_to_load)
+    main_model.eval()
     out = main_model.get_main_network_parts()
     out["timed_out"] = timeout_triggered
     return out
