@@ -849,7 +849,19 @@ class _iLTMBase(BaseEstimator):
 
         elif self.preprocessing == 'realmlp_td_s_v0':
             logger.debug("Preprocessing with realmlp_td_s_v0")
-            preprocessing_objects['pipeline'] = get_realmlp_td_s_pipeline_separated(cat_features=self.cat_features)
+            preprocessing_objects['pipeline'] = get_realmlp_td_s_pipeline_separated(
+                cat_features=self.cat_features,
+                # In the concat checkpoint, thousands of dense binary tree
+                # columns flow through the numerical branch. They ultimately
+                # become float32 in RobustScaleSmoothClipTransform, so prevent
+                # ColumnTransformer from first promoting the full matrix to
+                # float64 due to mixed integer/float input blocks.
+                output_dtype=(
+                    np.float32
+                    if self.tree_embedding and self.concat_tree_with_orig_features
+                    else None
+                ),
+            )
 
             if isinstance(x, np.ndarray) and np.issubdtype(x.dtype, np.number):
                 pass

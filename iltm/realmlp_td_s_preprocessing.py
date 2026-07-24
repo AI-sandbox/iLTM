@@ -2,6 +2,7 @@
 import os
 import numpy as np
 import pandas as pd
+from pandas.api.types import is_numeric_dtype
 import sklearn
 from sklearn.pipeline import Pipeline
 from sklearn.base import BaseEstimator, TransformerMixin
@@ -9,12 +10,27 @@ from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OrdinalEncoder, FunctionTransformer
 
 
-def to_numeric_coerce(df: pd.DataFrame) -> pd.DataFrame:
+def to_numeric_coerce(
+    df: pd.DataFrame,
+    *,
+    dtype: np.dtype | type | None = None,
+) -> pd.DataFrame:
     """Top-level function so the pipeline is picklable."""
-    return df.apply(pd.to_numeric, errors='coerce')
+    if dtype is not None and all(
+        is_numeric_dtype(dt) and not isinstance(dt, pd.SparseDtype)
+        for dt in df.dtypes
+    ):
+        return df.astype(dtype, copy=True)
+    result = df.apply(pd.to_numeric, errors='coerce')
+    if dtype is not None:
+        result = result.astype(dtype)
+    return result
 
 
 class CustomOneHotEncoder(BaseEstimator, TransformerMixin):
+    def __init__(self, dtype=np.int64):
+        self.dtype = dtype
+
     def fit(self, X, y=None):
         self.ordinal_enc_ = OrdinalEncoder(unknown_value=np.nan, encoded_missing_value=np.nan,
                                            handle_unknown='use_encoded_value',
@@ -40,7 +56,7 @@ class CustomOneHotEncoder(BaseEstimator, TransformerMixin):
             column = x_enc[:, i]
             idxs = np.arange(n_samples)
             isnan = np.isnan(column)
-            out_arr = np.zeros(shape=(n_samples, cat_size), dtype=np.int64)
+            out_arr = np.zeros(shape=(n_samples, cat_size), dtype=self.dtype)
             # do one-hot encoding, encode nan (missing or unknown) values to all zeros
             out_arr[idxs[~isnan], column[~isnan].astype(np.int64)] = 1#.
             if cat_size == 2:
@@ -56,7 +72,12 @@ class CustomOneHotPipeline(BaseEstimator, TransformerMixin):
     Apply CustomOneHotEncoder only to specified categorical features.
     """
 
-    def __init__(self, cat_features: list[int], max_cat_size: int = 12):
+    def __init__(
+        self,
+        cat_features: list[int],
+        max_cat_size: int = 12,
+        output_dtype: np.dtype | type | None = None,
+    ):
         """
         Initialize the pipeline with specified categorical feature indices.
 
@@ -66,6 +87,7 @@ class CustomOneHotPipeline(BaseEstimator, TransformerMixin):
         """
         self.cat_features = cat_features
         self.max_cat_size = max_cat_size
+        self.output_dtype = output_dtype
 
     def _fit_transform(self, X):
         X = pd.DataFrame(X)
@@ -97,13 +119,32 @@ class CustomOneHotPipeline(BaseEstimator, TransformerMixin):
         remaining_columns = [c for c in X.columns if c not in cat_column_names]
         # Define a pipeline for numerical columns to convert them to numeric types
         numerical_pipeline = Pipeline([
-            ('to_numeric', FunctionTransformer(to_numeric_coerce, validate=False))
+            (
+                'to_numeric',
+                FunctionTransformer(
+                    to_numeric_coerce,
+                    validate=False,
+                    kw_args={'dtype': self.output_dtype},
+                ),
+            )
         ])
         # Define transformers based on the split
         transformers = []
         
         if one_hot_columns:
-            transformers.append(('one_hot', CustomOneHotEncoder(), one_hot_columns))
+            transformers.append(
+                (
+                    'one_hot',
+                    CustomOneHotEncoder(
+                        dtype=(
+                            np.int64
+                            if self.output_dtype is None
+                            else self.output_dtype
+                        )
+                    ),
+                    one_hot_columns,
+                )
+            )
         
         if other_cat_columns:
             # You can choose to apply a different encoder here, e.g., OrdinalEncoder or embeddings
@@ -230,13 +271,20 @@ class RealMLPTDSepPipeline(BaseEstimator, TransformerMixin):
     Wrap the existing realmlp-td-s pipeline but at transform-time
     split its output into (x_num, x_cat).
     """
-    def __init__(self, cat_features, max_cat_size: int = 12):
+    def __init__(
+        self,
+        cat_features,
+        max_cat_size: int = 12,
+        output_dtype: np.dtype | type | None = None,
+    ):
         self.cat_features = [] if cat_features is None else cat_features
         self.max_cat_size = max_cat_size
+        self.output_dtype = output_dtype
         # delegate to the original pipeline
         self._pipe = sklearn.pipeline.Pipeline([
             ('one_hot', CustomOneHotPipeline(cat_features=self.cat_features,
-                                             max_cat_size=max_cat_size)),
+                                             max_cat_size=max_cat_size,
+                                             output_dtype=output_dtype)),
             ('rssc',    RobustScaleSmoothClipTransform())
         ])
 
@@ -291,9 +339,13 @@ class RealMLPTDSepPipeline(BaseEstimator, TransformerMixin):
         return x_num, x_cat
 
 
-def get_realmlp_td_s_pipeline_separated(cat_features, max_cat_size: int = 12):
+def get_realmlp_td_s_pipeline_separated(
+    cat_features,
+    max_cat_size: int = 12,
+    output_dtype: np.dtype | type | None = None,
+):
     """
     Returns a transformer whose transform(X) gives (x_num, x_cat)
     instead of the single concatenated array.
     """
-    return RealMLPTDSepPipeline(cat_features, max_cat_size)
+    return RealMLPTDSepPipeline(cat_features, max_cat_size, output_dtype)
