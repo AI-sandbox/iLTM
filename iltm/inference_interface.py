@@ -1301,6 +1301,8 @@ class _iLTMBase(BaseEstimator):
                 from iltm.utils import is_cuda_oom, clear_cuda_cache
                 if not is_cuda_oom(e) or bs <= 128:
                     raise
+                outs.clear()
+                out = None
                 clear_cuda_cache()
                 new_bs = max(128, bs // 2)
                 logger.warning("CUDA OOM during inference forward. Reducing batch size %d -> %d", bs, new_bs)
