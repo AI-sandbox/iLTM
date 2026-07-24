@@ -1124,12 +1124,6 @@ class _iLTMBase(BaseEstimator):
             if X_val is not None:
                 if self.feature_bagging and feature_bagging_idxs is not None and not isinstance(X_val, dict):
                     X_val = X_val[:, feature_bagging_idxs]
-                if isinstance(X_val, dict):
-                    X_val = {'x_num': X_val['x_num'].to(self.device), 'x_cat': X_val['x_cat'].to(self.device)}
-                else:
-                    X_val = X_val.to(self.device)
-                if y_val is not None:
-                    y_val = y_val.to(self.device)
 
             attempts = 0
             cur_bs = int(self.finetuning_batch_size)
