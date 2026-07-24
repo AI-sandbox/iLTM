@@ -145,18 +145,29 @@ class TreeEmbedding:
         return '0'
 
 
-    def _handle_categorical_features(self, X: pd.DataFrame | np.ndarray) -> pd.DataFrame:
+    def _handle_categorical_features(
+        self,
+        X: pd.DataFrame | np.ndarray,
+        *,
+        fit: bool = False,
+    ) -> pd.DataFrame:
         """
         Encodes categorical features based on the tree model requirements.
 
         Parameters:
             X (pd.DataFrame): Input features.
+            fit (bool): Whether to fit new encoders. This must only be True for
+                the tree-training data; validation and inference data must use
+                the training encoders.
 
         Returns:
             pd.DataFrame: Transformed features with categorical variables encoded.
         """
         X_encoded = X.copy()
         X_encoded = pd.DataFrame(X_encoded)
+
+        if fit:
+            self.encoders = {}
 
         # If the model is CatBoost, do nothing (it handles categorical features natively).
         if self.tree_model == 'CatBoost':
@@ -165,19 +176,26 @@ class TreeEmbedding:
         # For all other supported tree-based models, perform encoding if categorical features are specified.
         if self.tree_model in ['GB', 'RT', 'XGBoost_approx', 'XGBoost_hist']:
             if self.cat_features:
-                # Convert indices in self.cat_features to column names
-                cat_feature_cols = X_encoded.columns[self.cat_features]
-
-                for col in cat_feature_cols:
+                for feature_idx in self.cat_features:
+                    col = X_encoded.columns[feature_idx]
                     # force categorical columns to string so there's a single uniform type (encoder crashes for mixed types)
                     X_encoded[col] = X_encoded[col].astype(str)
 
-                    encoder = OrdinalEncoder(
-                        handle_unknown='use_encoded_value',
-                        unknown_value=-1
-                    )
-                    X_encoded[[col]] = encoder.fit_transform(X_encoded[[col]])
-                    self.encoders[col] = encoder
+                    if fit:
+                        encoder = OrdinalEncoder(
+                            handle_unknown='use_encoded_value',
+                            unknown_value=-1
+                        )
+                        X_encoded[[col]] = encoder.fit_transform(X_encoded[[col]])
+                        self.encoders[col] = encoder
+                    else:
+                        encoder = self.encoders.get(col)
+                        if encoder is None:
+                            raise RuntimeError(
+                                f"No fitted categorical encoder for feature {col!r}. "
+                                "Call fit_tree() before transforming data."
+                            )
+                        X_encoded[[col]] = encoder.transform(X_encoded[[col]])
 
             return X_encoded
 
@@ -336,7 +354,7 @@ class TreeEmbedding:
                 X, y = X_train, y_train
             else:
                 X_val, y_val = eval_set
-                X_val = self._handle_categorical_features(X_val)
+                X_val = self._handle_categorical_features(X_val, fit=False)
 
         # Now fit the chosen model
         if self.tree_model in ['XGBoost_approx', 'XGBoost_hist']:
@@ -642,7 +660,7 @@ class TreeEmbedding:
         logger.info(f"Fitting tree model: {self.tree_model}")
 
         # Handle categorical features
-        X_encoded = self._handle_categorical_features(X)
+        X_encoded = self._handle_categorical_features(X, fit=True)
 
         # Fit the tree-based model
         self._fit_model(X_encoded, y, eval_set)
@@ -700,18 +718,9 @@ class TreeEmbedding:
         logger.info(f"Transforming data using tree model: {self.tree_model}")
         
         # Handle categorical features
-        X_encoded = X.copy()
-        X_encoded = pd.DataFrame(X_encoded)
+        X_encoded = pd.DataFrame(X.copy())
         orig_data_shape = X_encoded.shape
-        if self.tree_model in ['GB', 'RT', 'XGBoost_approx', 'XGBoost_hist']:
-            for col, encoder in self.encoders.items():
-                X_encoded[col] = X_encoded[col].astype(str)
-                X_encoded[[col]] = encoder.transform(X_encoded[[col]])
-        elif self.tree_model == 'CatBoost':
-            # CatBoost handles categorical features natively
-            pass
-        else:
-            raise ValueError(f"Unknown tree-based model: {self.tree_model}")
+        X_encoded = self._handle_categorical_features(X_encoded, fit=False)
 
         # Get embeddings
         emb = self._get_embeddings(X_encoded)
@@ -745,7 +754,7 @@ class TreeEmbedding:
         """
         logger.info(f"Getting predictions using tree model: {self.tree_model}")
         
-        X_prepared = self._handle_categorical_features(X)
+        X_prepared = self._handle_categorical_features(X, fit=False)
         X_prepared = self._handle_inf_and_value_too_large(X_prepared)
 
         # Doesn't work with RT
