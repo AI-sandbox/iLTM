@@ -223,10 +223,7 @@ class RealMLPTDSepPipeline(BaseEstimator, TransformerMixin):
             ('rssc',    RobustScaleSmoothClipTransform())
         ])
 
-    def fit(self, X, y=None):
-        X_df = pd.DataFrame(X)
-        # 1) fit the combined pipeline
-        self._pipe.fit(X_df, y)
+    def _record_fitted_metadata(self, X_df):
         # Explicitly mark inner pipeline as fitted so sklearn’s transform guard passes
         setattr(self._pipe, "is_fitted_", True)
         # also mirror common fit markers on the wrapper itself
@@ -252,7 +249,20 @@ class RealMLPTDSepPipeline(BaseEstimator, TransformerMixin):
                     cat_dim += len(cols)
 
         self._cat_dim = int(cat_dim)
+
+    def fit(self, X, y=None):
+        X_df = pd.DataFrame(X)
+        self._pipe.fit(X_df, y)
+        self._record_fitted_metadata(X_df)
         return self
+
+    def fit_transform(self, X, y=None, **fit_params):
+        X_df = pd.DataFrame(X)
+        full = self._pipe.fit_transform(X_df, y, **fit_params)
+        self._record_fitted_metadata(X_df)
+        x_cat = full[:, :self._cat_dim]
+        x_num = full[:, self._cat_dim:]
+        return x_num, x_cat
 
     def transform(self, X):
         X_df = pd.DataFrame(X)

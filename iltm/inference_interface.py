@@ -861,8 +861,7 @@ class _iLTMBase(BaseEstimator):
             if isinstance(x, np.ndarray) and np.issubdtype(x.dtype, np.floating):
                 x = x.astype(np.float32, copy=False)
 
-            preprocessing_objects['pipeline'].fit(x)
-            x_num, x_cat = preprocessing_objects['pipeline'].transform(x)
+            x_num, x_cat = preprocessing_objects['pipeline'].fit_transform(x)
 
             # nan checks numeric
             preprocessing_objects['all_nan_num_columns'] = np.isnan(x_num).all(axis=0)
