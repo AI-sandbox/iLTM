@@ -213,7 +213,21 @@ def transform_data_for_main_network(X, cfg, device, rf, pca, norm,
             X = F.pad(X, (0, cfg['n_dims'] - X.shape[1]), value=0)
         X = torch.clamp(X, -cfg['clip_data_value'], cfg['clip_data_value'])
         if norm is not None:
-            X = norm(X)
+            singleton_batch_norm = (
+                training_finetuning
+                and X.shape[0] == 1
+                and isinstance(norm, nn.BatchNorm1d)
+                and norm.training
+            )
+            if singleton_batch_norm:
+                was_training = norm.training
+                norm.eval()
+                try:
+                    X = norm(X)
+                finally:
+                    norm.train(was_training)
+            else:
+                X = norm(X)
     return X
 
 
