@@ -2323,19 +2323,41 @@ class iLTMClassifier(_iLTMBase, ClassifierMixin, PermutationImportanceMixin):
         self.n_classes_ = len(self.classes_)
         self.n_outputs_ = self.n_classes_
 
-        # Sanity check and possibly align eval_set labels
+        # Align validation labels to the class indices learned from training.
         if eval_set is not None:
             eval_X, eval_y = eval_set
-            classes_in_eval, eval_y_proc = np.unique(eval_y, return_inverse=True)
+            eval_y_arr = np.asarray(eval_y).reshape(-1)
+            known_class_mask = np.isin(eval_y_arr, self.classes_)
 
-            # Check if some classes in the evaluation set are not present in the original dataset
-            if not set(classes_in_eval).issubset(set(self.classes_)):
-                logger.debug(f"Classes in original dataset: {self.classes_}, classes in evaluation set: {classes_in_eval}")
-                logger.debug("Removing samples with unseen classes from the evaluation set.")
-                mask = np.isin(eval_y, self.classes_)
-                eval_X, eval_y = eval_X[mask], eval_y[mask]
+            if not np.all(known_class_mask):
+                unseen_classes = np.unique(eval_y_arr[~known_class_mask])
+                logger.warning(
+                    "Removing %d validation samples whose classes were not seen in training: %s",
+                    int((~known_class_mask).sum()),
+                    unseen_classes,
+                )
+                if isinstance(eval_X, pd.DataFrame):
+                    eval_X = eval_X.iloc[known_class_mask]
+                else:
+                    eval_X = np.asarray(eval_X)[known_class_mask]
+                eval_y_arr = eval_y_arr[known_class_mask]
 
-            eval_set = eval_X, eval_y_proc
+            if eval_y_arr.size == 0:
+                logger.warning(
+                    "Ignoring eval_set because none of its labels were seen in training."
+                )
+                eval_set = None
+            else:
+                class_to_index = {
+                    class_label: class_index
+                    for class_index, class_label in enumerate(self.classes_)
+                }
+                eval_y_proc = np.fromiter(
+                    (class_to_index[class_label] for class_label in eval_y_arr),
+                    dtype=np.int64,
+                    count=eval_y_arr.size,
+                )
+                eval_set = eval_X, eval_y_proc
 
         result = self._fit_common(
             X, y_proc,
