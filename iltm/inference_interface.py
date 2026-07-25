@@ -1849,6 +1849,12 @@ class _iLTMBase(BaseEstimator):
             remaining = fit_deadline - fit_end_time
             logger.debug(f"_fit_common END: remaining time={remaining:.2f}s, fit_duration={fit_duration:.2f}s" if fit_duration else f"_fit_common END: remaining time={remaining:.2f}s")
         self._release_training_model()
+        if not self.predictors_:
+            if fit_deadline is not None and fit_end_time >= fit_deadline:
+                raise TimeoutError(
+                    "iLTM fit time budget expired before the first predictor could be generated."
+                )
+            raise RuntimeError("iLTM fit completed without generating any predictors.")
         logger.info(f"{len(self.predictors_)} predictors generated. Model fitted and ready for inference.")
         return self
 
