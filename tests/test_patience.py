@@ -43,6 +43,7 @@ def _run_plateau(
     cap: int | None,
     patience_epochs: int = 3,
     patience_checks: int | None = None,
+    subset_max_samples: int | None = None,
 ):
     monkeypatch.setattr(iltm_utils, "MainNetworkTrainable", _PlateauModel)
     X = torch.arange(9, dtype=torch.float32).reshape(-1, 1)
@@ -71,7 +72,7 @@ def _run_plateau(
         val_checks_per_epoch_target=4,
         max_train_batches_per_epoch=cap,
         finetuning_subset_frac=None,
-        finetuning_subset_max_samples=None,
+        finetuning_subset_max_samples=subset_max_samples,
         val_max_samples=None,
         min_epochs=0,
         cooldown_checks=0,
@@ -102,3 +103,28 @@ def test_explicit_check_patience_is_cap_invariant(monkeypatch, cap):
         patience_checks=3,
     )
     assert result["training_batches"] == 6
+
+
+def test_epoch_subset_keeps_full_training_tensors(monkeypatch):
+    captured = []
+
+    class _StopLoaderConstruction(Exception):
+        pass
+
+    def capture_loader(dataset, *args, **kwargs):
+        captured.append(dataset)
+        raise _StopLoaderConstruction
+
+    monkeypatch.setattr(iltm_utils, "DataLoader", capture_loader)
+
+    with pytest.raises(_StopLoaderConstruction):
+        _run_plateau(
+            monkeypatch,
+            cap=None,
+            subset_max_samples=4,
+        )
+
+    dataset = captured[0]
+    assert isinstance(dataset, torch.utils.data.Subset)
+    assert len(dataset) == 4
+    assert len(dataset.dataset) == 9

@@ -12,7 +12,7 @@ import logging
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Subset, TensorDataset
 from torch import Tensor
 import numpy as np
 import pandas as pd
@@ -789,9 +789,10 @@ def fine_tune_main_network(
     # Utility to create loaders for this epoch
     def build_epoch_loaders(X_train_full, y_train_full):
         idx = make_train_indices_epoch(len(X_train_full))
-        X_train_e = X_train_full[idx]
-        y_train_e = y_train_full[idx]
-        train_dataset = TensorDataset(X_train_e, y_train_e)
+        train_dataset = Subset(
+            TensorDataset(X_train_full, y_train_full),
+            idx,
+        )
         # Only use pin_memory for CUDA devices to avoid deprecation warnings on CPU
         use_pin_memory = device.type == 'cuda'
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_pin_memory)
