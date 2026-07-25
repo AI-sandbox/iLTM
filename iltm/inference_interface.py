@@ -872,6 +872,17 @@ class _iLTMBase(BaseEstimator):
     ) -> np.ndarray:
         """Combine split preprocessing output, materializing only selected columns."""
         if selected_indices is None:
+            base = x_num.base
+            expected_shape = (
+                x_num.shape[0],
+                x_num.shape[1] + x_cat.shape[1],
+            )
+            if (
+                isinstance(base, np.ndarray)
+                and x_cat.base is base
+                and base.shape == expected_shape
+            ):
+                return base
             return np.concatenate([x_num, x_cat], axis=1)
 
         selected_indices = np.asarray(selected_indices, dtype=np.intp)

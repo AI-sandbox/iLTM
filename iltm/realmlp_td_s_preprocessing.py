@@ -129,6 +129,7 @@ class CustomOneHotPipeline(BaseEstimator, TransformerMixin):
         cat_features: list[int],
         max_cat_size: int = 12,
         output_dtype: np.dtype | type | None = None,
+        numerical_first: bool = False,
     ):
         """
         Initialize the pipeline with specified categorical feature indices.
@@ -140,6 +141,7 @@ class CustomOneHotPipeline(BaseEstimator, TransformerMixin):
         self.cat_features = cat_features
         self.max_cat_size = max_cat_size
         self.output_dtype = output_dtype
+        self.numerical_first = numerical_first
 
     def _fit_transform(self, X):
         X = pd.DataFrame(X)
@@ -169,6 +171,7 @@ class CustomOneHotPipeline(BaseEstimator, TransformerMixin):
         ]
         # Identify remaining numerical columns by excluding categorical columns
         remaining_columns = [c for c in X.columns if c not in cat_column_names]
+        self.num_output_dim_ = len(remaining_columns)
         # Define a pipeline for numerical columns to convert them to numeric types
         numerical_pipeline = Pipeline([
             (
@@ -182,6 +185,9 @@ class CustomOneHotPipeline(BaseEstimator, TransformerMixin):
         ])
         # Define transformers based on the split
         transformers = []
+
+        if remaining_columns and self.numerical_first:
+            transformers.append(('numerical', numerical_pipeline, remaining_columns))
         
         if one_hot_columns:
             transformers.append(
@@ -207,7 +213,7 @@ class CustomOneHotPipeline(BaseEstimator, TransformerMixin):
                 dtype=np.float32
             ), other_cat_columns))
         
-        if remaining_columns:
+        if remaining_columns and not self.numerical_first:
             transformers.append(('numerical', numerical_pipeline, remaining_columns))
         
         # Initialize the ColumnTransformer with the specified transformers
@@ -239,8 +245,9 @@ class RobustScaleSmoothClipTransform(BaseEstimator, TransformerMixin):
     Any NaN at transform time is filled with the training median so the output is 0.
     Columns that are constant or all-NaN produce all zeros.
     """
-    def __init__(self, clip_divisor: float = 3.0):
+    def __init__(self, clip_divisor: float = 3.0, copy: bool = True):
         self.clip_divisor = float(clip_divisor)
+        self.copy = copy
 
     def fit(self, X, y=None):
         # ndarray only
@@ -327,7 +334,14 @@ class RobustScaleSmoothClipTransform(BaseEstimator, TransformerMixin):
         assert isinstance(X, np.ndarray) and X.ndim == 2
 
         n_samples, n_features = X.shape
-        out = np.empty((n_samples, n_features), dtype=np.float32)
+        if (
+            not self.copy
+            and X.dtype == np.float32
+            and X.flags.writeable
+        ):
+            out = X
+        else:
+            out = np.empty((n_samples, n_features), dtype=np.float32)
         m = self._median
         f = self._factors
         d = np.float32(self.clip_divisor)
@@ -340,6 +354,8 @@ class RobustScaleSmoothClipTransform(BaseEstimator, TransformerMixin):
 
             # impute NaNs to training medians so they map to 0 after scaling
             if np.isnan(chunk).any():
+                if out is not X and np.shares_memory(chunk, X):
+                    chunk = chunk.copy()
                 r, c = np.where(np.isnan(chunk))
                 if r.size:
                     chunk[r, c] = m[c]
@@ -353,7 +369,7 @@ class RobustScaleSmoothClipTransform(BaseEstimator, TransformerMixin):
 def get_realmlp_td_s_pipeline(cat_features):
     pipeline = sklearn.pipeline.Pipeline([
         ('one_hot', CustomOneHotPipeline(cat_features=cat_features)),
-        ('rssc', RobustScaleSmoothClipTransform())
+        ('rssc', RobustScaleSmoothClipTransform(copy=False))
     ])
     
     return pipeline
@@ -377,8 +393,9 @@ class RealMLPTDSepPipeline(BaseEstimator, TransformerMixin):
         self._pipe = sklearn.pipeline.Pipeline([
             ('one_hot', CustomOneHotPipeline(cat_features=self.cat_features,
                                              max_cat_size=max_cat_size,
-                                             output_dtype=output_dtype)),
-            ('rssc',    RobustScaleSmoothClipTransform())
+                                             output_dtype=output_dtype,
+                                             numerical_first=True)),
+            ('rssc',    RobustScaleSmoothClipTransform(copy=False))
         ])
 
     def _record_fitted_metadata(self, X_df):
@@ -389,7 +406,8 @@ class RealMLPTDSepPipeline(BaseEstimator, TransformerMixin):
         self.n_features_in_ = X_df.shape[1]
         # 2) figure out how many *categorical* columns it is producing
         #    by inspecting the ColumnTransformer inside CustomOneHotPipeline
-        ct = self._pipe.named_steps['one_hot'].tfm_
+        one_hot = self._pipe.named_steps['one_hot']
+        ct = one_hot.tfm_
         cat_dim = 0
         if hasattr(ct, "output_indices_"):
             idxs = ct.output_indices_
@@ -406,6 +424,7 @@ class RealMLPTDSepPipeline(BaseEstimator, TransformerMixin):
                 elif name == "ordinal":
                     cat_dim += len(cols)
 
+        self._num_dim = int(one_hot.num_output_dim_)
         self._cat_dim = int(cat_dim)
 
     def fit(self, X, y=None):
@@ -418,8 +437,8 @@ class RealMLPTDSepPipeline(BaseEstimator, TransformerMixin):
         X_df = pd.DataFrame(X)
         full = self._pipe.fit_transform(X_df, y, **fit_params)
         self._record_fitted_metadata(X_df)
-        x_cat = full[:, :self._cat_dim]
-        x_num = full[:, self._cat_dim:]
+        x_num = full[:, :self._num_dim]
+        x_cat = full[:, self._num_dim:]
         return x_num, x_cat
 
     def transform(self, X):
@@ -427,8 +446,8 @@ class RealMLPTDSepPipeline(BaseEstimator, TransformerMixin):
         # self._pipe has is_fitted_ set in fit, so this is safe on sklearn>=1.7
         full = self._pipe.transform(X_df)
         # split!
-        x_cat = full[:, :self._cat_dim]
-        x_num = full[:, self._cat_dim:]
+        x_num = full[:, :self._num_dim]
+        x_cat = full[:, self._num_dim:]
         return x_num, x_cat
 
 

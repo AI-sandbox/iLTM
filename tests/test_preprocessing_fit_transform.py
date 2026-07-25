@@ -9,6 +9,7 @@ from iltm import iLTMClassifier
 from iltm.realmlp_td_s_preprocessing import (
     CustomOneHotPipeline,
     RealMLPTDSepPipeline,
+    RobustScaleSmoothClipTransform,
 )
 
 
@@ -119,3 +120,41 @@ def test_iltm_preprocessor_uses_fit_transform(monkeypatch):
         y_out,
         np.array([0, 1, 0, 1, 0, 1]),
     )
+
+
+def test_robust_transform_can_reuse_float32_input():
+    X = np.asfortranarray(
+        np.array(
+            [
+                [1.0, 0.0, np.nan],
+                [2.0, 1.0, 4.0],
+                [8.0, 0.0, 2.0],
+                [4.0, 1.0, 3.0],
+            ],
+            dtype=np.float32,
+        )
+    )
+    input_buffer = X.copy(order="F")
+    expected_input = X.copy(order="F")
+    expected = RobustScaleSmoothClipTransform().fit(X).transform(expected_input)
+    transform = RobustScaleSmoothClipTransform(copy=False).fit(X)
+
+    actual = transform.transform(input_buffer)
+
+    assert actual is input_buffer
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_equal(expected_input, X)
+
+
+def test_split_pipeline_reuses_numeric_first_output():
+    pipeline = RealMLPTDSepPipeline(
+        cat_features=[1],
+        output_dtype=np.float32,
+    )
+    x_num, x_cat = pipeline.fit_transform(_mixed_frame())
+    expected = np.concatenate([x_num, x_cat], axis=1)
+
+    combined = iLTMClassifier._combine_preprocessed_columns(x_num, x_cat)
+
+    assert combined is x_num.base
+    np.testing.assert_array_equal(combined, expected)
