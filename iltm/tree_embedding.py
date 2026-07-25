@@ -408,7 +408,7 @@ class TreeEmbedding:
                 evals = None
 
             num_rounds = int(self.n_estimators or 100)
-            max_attempts = 4
+            max_attempts = 16
 
             for attempt in range(1, max_attempts + 1):
                 try:
@@ -429,6 +429,8 @@ class TreeEmbedding:
                         raise
                     logger.warning("XGBoost OOM on attempt %d. Adapting and retrying.", attempt)
                     clear_cuda_cache()
+                    if attempt == max_attempts:
+                        raise
 
                     # Backoff order: max_bin -> max_leaves -> max_depth -> rounds
                     if params.get('max_bin', None) is None:
@@ -438,7 +440,7 @@ class TreeEmbedding:
                         params['max_bin'] = max(64, params['max_bin'] // 2)
                         continue
 
-                    if params.get('max_leaves', None):
+                    if int(params.get('max_leaves', 0) or 0) > 31:
                         params['max_leaves'] = max(31, int(params['max_leaves'] // 2))
                         continue
 
@@ -539,8 +541,7 @@ class TreeEmbedding:
                 train_pool = Pool(X_prep, label=y, cat_features=self.cat_features)
                 eval_pool = None
 
-            # NEW: OOM-safe training loop with backoff and CPU fallback
-            max_attempts = 4
+            max_attempts = 16
             iters = int(catboost_params.get('iterations', 100))
             max_depth_local = catboost_params.get('max_depth', None)
             max_leaves_local = catboost_params.get('max_leaves', None)
@@ -574,6 +575,8 @@ class TreeEmbedding:
                         raise
                     logger.warning("CatBoost OOM on attempt %d. Adapting and retrying.", attempt)
                     clear_cuda_cache()
+                    if attempt == max_attempts:
+                        raise
 
                     # First backoff: reduce iterations
                     if iters > 100:
