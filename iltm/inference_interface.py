@@ -5,7 +5,6 @@ import gc
 import math
 import logging
 from typing import List, Tuple, Optional, Dict, Any
-from types import SimpleNamespace
 import time
 
 import requests
@@ -625,20 +624,12 @@ class _iLTMBase(BaseEstimator):
             "n_ensemble": self.n_ensemble,
         }
 
-    @classmethod
-    def __sklearn_tags__(cls, estimator=None):
-        try:
-            from sklearn.utils._tags import _DEFAULT_TAGS
-            base = dict(_DEFAULT_TAGS)
-        except Exception:
-            base = {}
-        base.update({
-            "requires_fit": True,
-            "allow_nan": True,
-            "non_deterministic": False,
-            "poor_score": False,
-        })
-        return SimpleNamespace(**base)
+    def __sklearn_tags__(self):
+        tags = super().__sklearn_tags__()
+        tags.requires_fit = True
+        tags.non_deterministic = False
+        tags.input_tags.allow_nan = True
+        return tags
 
     def get_params(self, deep=True):
         params = super().get_params(deep=deep)
@@ -784,12 +775,6 @@ class _iLTMBase(BaseEstimator):
         model.eval()
         self._model_cache[cache_key] = model
         return model
-
-    def _get_tags(self) -> dict:
-        tags = super()._get_tags()
-        tags["allow_nan"] = True
-        return tags
-    
 
     def _auto_tune_for_memory(self):
         from iltm.utils import get_gpu_memory_info
@@ -1958,7 +1943,7 @@ class _iLTMBase(BaseEstimator):
 # =====================================================================
 #                           REGRESSOR
 # =====================================================================
-class iLTMRegressor(_iLTMBase, RegressorMixin, PermutationImportanceMixin):
+class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
     """
     Scikit-learn like regressor interface for iLTM.
     """
@@ -2170,7 +2155,7 @@ class iLTMRegressor(_iLTMBase, RegressorMixin, PermutationImportanceMixin):
 # =====================================================================
 #                           CLASSIFIER
 # =====================================================================
-class iLTMClassifier(_iLTMBase, ClassifierMixin, PermutationImportanceMixin):
+class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
     """
     Scikit-learn like classifier interface for iLTM.
     """

@@ -1,12 +1,32 @@
 import pytest
 import numpy as np
 from sklearn.utils.estimator_checks import check_estimator
-from sklearn.base import clone
+from sklearn.utils import get_tags
+from sklearn.base import clone, is_classifier, is_regressor
 
 from iltm import iLTMClassifier, iLTMRegressor
 
 
 class TestSklearnAPI:
+
+    @pytest.mark.parametrize(
+        ("estimator_class", "estimator_type"),
+        [
+            (iLTMClassifier, "classifier"),
+            (iLTMRegressor, "regressor"),
+        ],
+    )
+    def test_estimator_tags(self, estimator_class, estimator_type):
+        estimator = estimator_class(checkpoint=None, device="cpu")
+        tags = get_tags(estimator)
+
+        assert tags.estimator_type == estimator_type
+        assert tags.target_tags.required
+        assert tags.input_tags.allow_nan
+        assert tags.requires_fit
+        assert not tags.non_deterministic
+        assert is_classifier(estimator) == (estimator_type == "classifier")
+        assert is_regressor(estimator) == (estimator_type == "regressor")
     
     def test_classifier_clone(self, tiny_classification_data):
         X, y = tiny_classification_data
@@ -87,4 +107,3 @@ class TestSklearnAPI:
         
         assert reg.n_ensemble == 5
         assert reg.finetuning_max_steps == 200
-
