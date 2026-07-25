@@ -1622,6 +1622,10 @@ def select_top_correlated_features(correlations: np.ndarray, num_features: int) 
         return np.array([], dtype=int)
     
     nonzero_correlations = correlations[nonzero_indices]
+
+    if num_features == 1:
+        strongest = np.argmax(np.abs(nonzero_correlations))
+        return np.array([nonzero_indices[strongest]], dtype=int)
     
     num_positive = num_features // 2
     num_negative = num_features - num_positive
