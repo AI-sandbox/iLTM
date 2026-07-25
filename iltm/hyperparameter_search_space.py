@@ -50,6 +50,8 @@ AVAILABLE_CHECKPOINTS = [
     "rtrcb",
 ]
 
+NON_TREE_EMBEDDING_CHECKPOINT_SUFFIXES = ("r128bn", "rnobn", "rtr")
+
 
 # A single hyperparameter specification and the full search space.
 HyperparamSpec = Dict[str, Any]
@@ -79,7 +81,21 @@ def _rand_log_uniform(rng: np.random.Generator, low: float, high: float) -> floa
     return float(np.exp(rng.uniform(log_low, log_high)))
 
 
-def _sample_from_spec(rng: np.random.Generator, spec: HyperparamSpec) -> Any:
+def _uses_non_tree_embedding_checkpoint(checkpoint: str | None) -> bool:
+    if checkpoint is None:
+        return False
+    checkpoint_name = str(checkpoint)
+    if checkpoint_name.endswith(".pth"):
+        checkpoint_name = checkpoint_name[:-4]
+    return checkpoint_name.endswith(NON_TREE_EMBEDDING_CHECKPOINT_SUFFIXES)
+
+
+def _sample_from_spec(
+    rng: np.random.Generator,
+    spec: HyperparamSpec,
+    *,
+    checkpoint: str | None = None,
+) -> Any:
     """
     Sample a single value from a HyperparamSpec entry.
 
@@ -98,6 +114,9 @@ def _sample_from_spec(rng: np.random.Generator, spec: HyperparamSpec) -> Any:
     if kind == "categorical":
         choices = spec["choices"]
         probs = spec.get("probs")
+        if _uses_non_tree_embedding_checkpoint(checkpoint):
+            choices = spec.get("non_tree_embedding_choices", choices)
+            probs = spec.get("non_tree_embedding_probs", probs)
         value = rng.choice(choices, p=probs)
         # Ensure we return plain Python scalars rather than NumPy scalars
         if isinstance(value, np.generic):
@@ -181,8 +200,47 @@ def get_hyperparameter_search_space(
         "clip_predictions": {"type": "categorical", "choices": [False, True]},
         "corr_select_k": {
             "type": "categorical",
-            "choices": [0, 1, 2, 5, 10, 20, 50, 100, 200, 300, 400, 512, 1024, 2048, 4096],
-            "probs": [0.20, 0.02, 0.02, 0.02, 0.03, 0.03, 0.05, 0.10, 0.15, 0.15, 0.08, 0.08, 0.03, 0.02, 0.02],
+            "choices": [0, 50, 100, 200, 300, 400, 512, 1024, 2048, 4096],
+            "probs": [
+                20 / 88,
+                5 / 88,
+                10 / 88,
+                15 / 88,
+                15 / 88,
+                8 / 88,
+                8 / 88,
+                3 / 88,
+                2 / 88,
+                2 / 88,
+            ],
+            "non_tree_embedding_choices": [
+                0,
+                5,
+                10,
+                50,
+                100,
+                200,
+                300,
+                400,
+                512,
+                1024,
+                2048,
+                4096,
+            ],
+            "non_tree_embedding_probs": [
+                20 / 93,
+                2 / 93,
+                3 / 93,
+                5 / 93,
+                10 / 93,
+                15 / 93,
+                15 / 93,
+                8 / 93,
+                8 / 93,
+                3 / 93,
+                2 / 93,
+                2 / 93,
+            ],
         },
     }
 
@@ -208,7 +266,11 @@ def sample_hyperparameters(
     cfg: Dict[str, Any] = {}
 
     for name, spec in space.items():
-        cfg[name] = _sample_from_spec(rng, spec)
+        cfg[name] = _sample_from_spec(
+            rng,
+            spec,
+            checkpoint=cfg.get("checkpoint"),
+        )
 
     return cfg
 

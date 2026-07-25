@@ -73,6 +73,54 @@ class TestSearchSpaceDefinition:
         space = get_hyperparameter_search_space(available_checkpoints=custom)
         assert space["checkpoint"]["choices"] == custom
 
+    def test_corr_select_k_excludes_aggressive_small_positive_cutoffs(self):
+        spec = get_hyperparameter_search_space()["corr_select_k"]
+
+        assert spec["choices"] == [0, 50, 100, 200, 300, 400, 512, 1024, 2048, 4096]
+        assert spec["probs"] == pytest.approx(
+            [
+                20 / 88,
+                5 / 88,
+                10 / 88,
+                15 / 88,
+                15 / 88,
+                8 / 88,
+                8 / 88,
+                3 / 88,
+                2 / 88,
+                2 / 88,
+            ]
+        )
+        assert spec["non_tree_embedding_choices"] == [
+            0,
+            5,
+            10,
+            50,
+            100,
+            200,
+            300,
+            400,
+            512,
+            1024,
+            2048,
+            4096,
+        ]
+        assert spec["non_tree_embedding_probs"] == pytest.approx(
+            [
+                20 / 93,
+                2 / 93,
+                3 / 93,
+                5 / 93,
+                10 / 93,
+                15 / 93,
+                15 / 93,
+                8 / 93,
+                8 / 93,
+                3 / 93,
+                2 / 93,
+                2 / 93,
+            ]
+        )
 
 class TestSampleHyperparameters:
     """Tests for the sampling helper that draws configs from the space."""
@@ -98,6 +146,27 @@ class TestSampleHyperparameters:
         custom = ["xgbrconcat", "cbrconcat"]
         cfg = sample_hyperparameters(rng, available_checkpoints=custom)
         assert cfg["checkpoint"] in custom
+
+    def test_corr_select_k_uses_checkpoint_specific_choices(self):
+        rng = np.random.default_rng(seed=7)
+        non_tree_values = {
+            sample_hyperparameters(
+                rng,
+                available_checkpoints=["r128bn"],
+            )["corr_select_k"]
+            for _ in range(500)
+        }
+        tree_values = {
+            sample_hyperparameters(
+                rng,
+                available_checkpoints=["xgbrconcat"],
+            )["corr_select_k"]
+            for _ in range(500)
+        }
+
+        assert {5, 10}.issubset(non_tree_values)
+        assert 5 not in tree_values
+        assert 10 not in tree_values
 
     def test_sample_reproducible_with_seed(self):
         """Same seed produces identical configurations."""
@@ -169,11 +238,8 @@ class TestSampledConfigParameterRanges:
             assert isinstance(config["clip_predictions"], bool)
             assert config["corr_select_k"] in [
                 0,
-                1,
-                2,
                 5,
                 10,
-                20,
                 50,
                 100,
                 200,
