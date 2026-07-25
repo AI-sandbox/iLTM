@@ -100,3 +100,35 @@ def test_validation_exception_restores_training_mode(monkeypatch):
 
     assert _FailingValidationModel.latest is not None
     assert _FailingValidationModel.latest.training is True
+
+
+def test_no_validation_keeps_finetuned_weights(monkeypatch):
+    monkeypatch.setattr(
+        iltm_utils,
+        "MainNetworkTrainable",
+        _ModeTrackingModel,
+    )
+    X = torch.arange(4, dtype=torch.float32).reshape(-1, 1)
+    iltm_utils.fine_tune_main_network(
+        cfg={},
+        X=X,
+        y=torch.ones(4),
+        n_classes=1,
+        rf=None,
+        pca=None,
+        main_network=[],
+        norm=None,
+        device=torch.device("cpu"),
+        max_epochs=1,
+        batch_size=2,
+        finetuning_lr=0.1,
+        X_val=None,
+        y_val=None,
+        finetuning_val_frac=0.0,
+        finetuning_subset_max_samples=None,
+        val_max_samples=None,
+    )
+
+    assert _ModeTrackingModel.latest is not None
+    assert _ModeTrackingModel.latest.training_batches == 2
+    assert _ModeTrackingModel.latest.weight.item() > 0.05

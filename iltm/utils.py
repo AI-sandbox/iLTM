@@ -1122,8 +1122,8 @@ def fine_tune_main_network(
         val_metric_name,
         _fmt_metric(es["best_val_metric"]),
     )
-    weights_to_load = es["best_model_wts"]
-    main_model.load_state_dict(weights_to_load)
+    if es["checks_done"] > 0:
+        main_model.load_state_dict(es["best_model_wts"])
     main_model.eval()
     out = main_model.get_main_network_parts()
     out["timed_out"] = timeout_triggered
