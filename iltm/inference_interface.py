@@ -1183,13 +1183,17 @@ class _iLTMBase(BaseEstimator):
                 y_pred = y_pred.repeat(n_repeats)
             elif pca_sampling == 'bootstrap':
                 additional_samples_needed = self.n_dims - y_pred.shape[0]
-                bootstrap_indices = torch.randint(0, len_X, (additional_samples_needed,))
+                bootstrap_indices = torch.randint(
+                    0,
+                    y_pred.shape[0],
+                    (additional_samples_needed,),
+                )
                 if isinstance(X_pred, dict):
-                    X_pred['x_num'] = torch.cat([X_pred['x_num'], X['x_num'][bootstrap_indices]])
-                    X_pred['x_cat'] = torch.cat([X_pred['x_cat'], X['x_cat'][bootstrap_indices]])
+                    X_pred['x_num'] = torch.cat([X_pred['x_num'], X_pred['x_num'][bootstrap_indices]])
+                    X_pred['x_cat'] = torch.cat([X_pred['x_cat'], X_pred['x_cat'][bootstrap_indices]])
                 else:
-                    X_pred = torch.cat([X_pred, X[bootstrap_indices]])
-                y_pred = torch.cat([y_pred, y[bootstrap_indices]])
+                    X_pred = torch.cat([X_pred, X_pred[bootstrap_indices]])
+                y_pred = torch.cat([y_pred, y_pred[bootstrap_indices]])
             elif pca_sampling == 'zeropad':
                 pass
             else:
