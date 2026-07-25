@@ -89,7 +89,7 @@ Common key args:
 
 Regressor only:
 - clip_predictions: clip to train target range.
-- normalize_predictions: z-normalize outputs before unscaling.
+- normalize_predictions: fit a fixed affine output calibration before unscaling.
 
 Classifier only:
 - voting: "soft" or "hard".

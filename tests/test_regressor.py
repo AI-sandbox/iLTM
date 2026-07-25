@@ -8,6 +8,26 @@ from sklearn.metrics import mean_squared_error, r2_score
 from iltm import iLTMRegressor
 
 
+def _mock_calibrated_regressor(monkeypatch, raw_predict):
+    reg = iLTMRegressor(
+        checkpoint=None,
+        device="cpu",
+        finetuning=False,
+        clip_predictions=False,
+    )
+
+    def fit_common(*args, **kwargs):
+        reg.normalize_predictions_ = True
+        reg.clip_predictions_ = False
+        reg.predictors_ = [{}]
+        reg.preprocessors_ = [{}]
+        return reg
+
+    monkeypatch.setattr(reg, "_fit_common", fit_common)
+    monkeypatch.setattr(reg, "_predict_ensemble", raw_predict)
+    return reg
+
+
 class TestiLTMRegressorBasic:
     
     def test_regression_fit_predict(self, small_regression_data):
@@ -156,26 +176,119 @@ class TestiLTMRegressorPreprocessing:
 
 class TestiLTMRegressorOptions:
 
-    def test_single_row_prediction_without_finetuning_is_finite(self, monkeypatch):
-        reg = iLTMRegressor(
-            checkpoint=None,
-            device="cpu",
-            finetuning=False,
+    def test_prediction_calibration_is_batch_invariant(self, monkeypatch):
+        def raw_predict(X, **kwargs):
+            return torch.as_tensor(
+                np.asarray(X)[:, 0],
+                dtype=torch.float32,
+            )
+
+        reg = _mock_calibrated_regressor(monkeypatch, raw_predict)
+
+        reg.fit(
+            np.array([[100.0], [101.0], [102.0], [103.0]]),
+            np.array([10.0, 12.0, 14.0, 16.0]),
+            eval_set=(
+                np.array([[0.0], [1.0], [2.0]]),
+                np.array([10.0, 12.0, 14.0]),
+            ),
         )
-        reg.n_outputs_ = 1
-        reg.normalize_predictions_ = True
-        reg.clip_predictions_ = False
-        reg._y_mean = 7.0
-        reg._y_std = 2.0
-        monkeypatch.setattr(
-            reg,
-            "_predict_ensemble",
-            lambda *args, **kwargs: torch.tensor([3.0]),
+        X_test = np.array([[3.0], [4.0]])
+
+        batch_predictions = reg.predict(X_test)
+        separate_predictions = np.concatenate(
+            [reg.predict(X_test[i : i + 1]) for i in range(len(X_test))]
         )
 
-        prediction = reg.predict(np.array([[1.0, 2.0]], dtype=np.float32))
+        np.testing.assert_allclose(batch_predictions, np.array([16.0, 18.0]))
+        np.testing.assert_array_equal(
+            separate_predictions,
+            batch_predictions,
+        )
 
-        np.testing.assert_array_equal(prediction, np.array([7.0]))
+    def test_prediction_calibration_uses_training_data_without_eval_set(
+        self,
+        monkeypatch,
+    ):
+        reg = _mock_calibrated_regressor(
+            monkeypatch,
+            lambda X, **kwargs: torch.as_tensor(
+                np.asarray(X)[:, 0],
+                dtype=torch.float32,
+            ),
+        )
+
+        reg.fit(
+            np.array([[0.0], [1.0], [2.0], [3.0]]),
+            np.array([10.0, 12.0, 14.0, 16.0]),
+        )
+
+        np.testing.assert_allclose(
+            reg.predict(np.array([[4.0], [5.0]])),
+            np.array([18.0, 20.0]),
+        )
+
+    def test_constant_prediction_calibration_uses_target_mean(
+        self,
+        monkeypatch,
+    ):
+        reg = _mock_calibrated_regressor(
+            monkeypatch,
+            lambda X, **kwargs: torch.full(
+                (len(X),),
+                3.0,
+                dtype=torch.float32,
+            ),
+        )
+
+        reg.fit(
+            np.array([[0.0], [1.0], [2.0]]),
+            np.array([10.0, 12.0, 14.0]),
+        )
+        predictions = reg.predict(np.array([[3.0], [4.0]]))
+
+        assert np.isfinite(predictions).all()
+        np.testing.assert_allclose(predictions, np.array([12.0, 12.0]))
+
+    def test_prediction_calibration_caps_dataframe_rows(self, monkeypatch):
+        rows_seen = []
+
+        def raw_predict(X, **kwargs):
+            rows_seen.append(len(X))
+            return torch.as_tensor(
+                np.array(X)[:, 0],
+                dtype=torch.float32,
+            )
+
+        reg = _mock_calibrated_regressor(monkeypatch, raw_predict)
+        X_calibration = pd.DataFrame({"value": np.arange(5000)})
+
+        reg.fit(
+            np.array([[0.0], [1.0]]),
+            np.array([0.0, 1.0]),
+            eval_set=(
+                X_calibration,
+                2.0 * X_calibration["value"].to_numpy(),
+            ),
+        )
+
+        assert rows_seen == [4096]
+
+    def test_prediction_calibration_failure_invalidates_fit(self, monkeypatch):
+        def fail_prediction(*args, **kwargs):
+            raise RuntimeError("synthetic calibration failure")
+
+        reg = _mock_calibrated_regressor(monkeypatch, fail_prediction)
+
+        with pytest.raises(RuntimeError, match="synthetic calibration failure"):
+            reg.fit(
+                np.array([[0.0], [1.0]]),
+                np.array([0.0, 1.0]),
+            )
+
+        assert not reg.__sklearn_is_fitted__()
+        assert reg.predictors_ == []
+        assert reg.preprocessors_ == []
     
     def test_no_finetuning(self, tiny_regression_data):
         X, y = tiny_regression_data

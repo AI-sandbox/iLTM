@@ -644,6 +644,8 @@ class _iLTMBase(BaseEstimator):
         self.predictors_ = []
         self.preprocessors_ = []
         self.tr_ = None
+        self.__dict__.pop("_prediction_calibration_slope_", None)
+        self.__dict__.pop("_prediction_calibration_intercept_", None)
 
     def get_params(self, deep=True):
         params = super().get_params(deep=deep)
@@ -1962,6 +1964,8 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
     Scikit-learn like regressor interface for iLTM.
     """
 
+    _prediction_calibration_max_rows = 4096
+
     def __init__(
         self,
         device: str = "cuda:0",
@@ -2142,15 +2146,87 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
                 fit_time_cushion_frac=fit_time_cushion_frac,
                 return_partial_on_timeout=return_partial_on_timeout,
             )
+            self._fit_succeeded = True
+            if self.normalize_predictions_:
+                if eval_set_proc is None:
+                    calibration_X, calibration_y = X, y_proc
+                else:
+                    calibration_X, calibration_y = eval_set_proc
+                self._fit_prediction_calibration(
+                    calibration_X,
+                    calibration_y,
+                )
         except BaseException:
             self._invalidate_fitted_state()
             self._release_training_model()
             raise
-        self._fit_succeeded = True
         fit_total_end = time.time()
         fit_total_duration = fit_total_end - fit_start_time
         logger.debug(f"iLTMRegressor.fit END: Total fit duration={fit_total_duration:.2f}s")
         return result
+
+    def _fit_prediction_calibration(
+        self,
+        X: np.ndarray | pd.DataFrame,
+        y: np.ndarray | pd.Series,
+    ) -> None:
+        y_calibration = np.asarray(y, dtype=np.float64).reshape(-1)
+        if y_calibration.size == 0:
+            raise ValueError("Prediction calibration requires at least one row.")
+        if len(y_calibration) > self._prediction_calibration_max_rows:
+            indices = np.random.default_rng(self.seed).choice(
+                len(y_calibration),
+                size=self._prediction_calibration_max_rows,
+                replace=False,
+            )
+            X = X.iloc[indices] if isinstance(X, pd.DataFrame) else X[indices]
+            y_calibration = y_calibration[indices]
+
+        raw_predictions = (
+            self._predict_ensemble(
+                X,
+                n_outputs=self.n_outputs_,
+                softmax_per_predictor=False,
+            )
+            .detach()
+            .float()
+            .cpu()
+            .numpy()
+            .astype(np.float64, copy=False)
+            .reshape(-1)
+        )
+        if raw_predictions.shape != y_calibration.shape:
+            raise ValueError(
+                "Prediction calibration requires one prediction per target."
+            )
+        if not (
+            np.isfinite(raw_predictions).all()
+            and np.isfinite(y_calibration).all()
+        ):
+            raise ValueError(
+                "Prediction calibration requires finite predictions and targets."
+            )
+
+        raw_centered = raw_predictions - raw_predictions.mean()
+        target_centered = y_calibration - y_calibration.mean()
+        denominator = float(np.dot(raw_centered, raw_centered))
+        raw_scale = max(
+            1.0,
+            float(np.dot(raw_predictions, raw_predictions)),
+        )
+        if denominator <= np.finfo(np.float64).eps * raw_scale:
+            slope = 0.0
+        else:
+            slope = float(np.dot(raw_centered, target_centered) / denominator)
+
+        intercept = float(
+            y_calibration.mean() - slope * raw_predictions.mean()
+        )
+        if not (np.isfinite(slope) and np.isfinite(intercept)):
+            raise ValueError("Prediction calibration produced non-finite values.")
+
+        self._prediction_calibration_slope_ = slope
+        self._prediction_calibration_intercept_ = intercept
 
     def predict(self, X: np.ndarray | pd.DataFrame) -> np.ndarray:
         check_is_fitted(self)
@@ -2159,8 +2235,15 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         )
 
         if self.normalize_predictions_:
-            prediction_std = yhats.std(unbiased=yhats.numel() > 1)
-            yhats = (yhats - yhats.mean()) / (prediction_std + 1e-6)
+            slope = getattr(self, "_prediction_calibration_slope_", None)
+            if slope is None:
+                prediction_std = yhats.std(unbiased=yhats.numel() > 1)
+                yhats = (yhats - yhats.mean()) / (prediction_std + 1e-6)
+            else:
+                yhats = (
+                    yhats * slope
+                    + self._prediction_calibration_intercept_
+                )
 
         if self.clip_predictions_:
             pred_min, pred_max = float(yhats.min()), float(yhats.max())
