@@ -1116,6 +1116,7 @@ class _iLTMBase(BaseEstimator):
         Returns: (X_pred, y_pred, feature_idxs)
         """
         n_features = X['x_num'].shape[1] + X['x_cat'].shape[1] if isinstance(X, dict) else X.shape[1]
+        len_X = X['x_num'].shape[0] if isinstance(X, dict) else X.shape[0]
 
         feature_idxs = None
         if self.feature_bagging and n_features >= self.feature_bagging_size:
@@ -1143,7 +1144,6 @@ class _iLTMBase(BaseEstimator):
             sampled_indices = torch.cat(sampled_indices)
             sampled_indices = sampled_indices[torch.randperm(len(sampled_indices))]
         else:
-            len_X = X['x_num'].shape[0] if isinstance(X, dict) else X.shape[0]
             sampled_indices = torch.randperm(len_X)[: self.batch_size]
 
         if isinstance(X, dict):
