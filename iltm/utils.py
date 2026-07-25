@@ -1178,7 +1178,9 @@ def robust_roc_auc_score(y_true: np.ndarray, y_score: np.ndarray, multi_class: s
     """
     Computes the ROC AUC score for binary or multi-class classification in a robust manner.
 
-    Handles binary classification by calculating the AUC for class 1's predicted probabilities.
+    Handles two-column binary classification using the second probability
+    column. If a multiclass score matrix contains only two target classes,
+    their labels are treated as encoded probability-column indices.
     For multi-class classification, it handles cases where not all classes are present in the test set.
     Specifically, it adjusts the predicted probabilities to ensure they sum to 1 after filtering
     out missing classes and avoids NaN values in the predictions.
@@ -1192,20 +1194,32 @@ def robust_roc_auc_score(y_true: np.ndarray, y_score: np.ndarray, multi_class: s
         multi_class (str): Specifies the strategy for handling multi-class ROC AUC.
                            - 'ovo' (One-vs-One, default)
                            - 'ovr' (One-vs-Rest)
-
     Returns:
         float: ROC AUC score for the given predictions and true labels, or NaN if there are unseen classes.
 
     Raises:
-        ValueError: If there are NaN values in the filtered predicted probabilities.
+        ValueError: If multiclass-subset labels are not valid encoded column indices.
     """
 
-    # Determine if it's binary classification or multi-class
-    if len(np.unique(y_true)) == 2:  # Binary classification
-        roc_auc = roc_auc_score(y_true, y_score[:, 1])
-    else:  # Multi-class classification, using One-vs-One strategy
-        classes_in_test = np.unique(y_true)
+    classes_in_test = np.unique(y_true)
 
+    # Determine if it's binary classification or multi-class
+    if len(classes_in_test) == 2:  # Binary classification
+        positive_class = classes_in_test[-1]
+        if y_score.shape[1] == 2:
+            positive_column = 1
+        elif (
+            isinstance(positive_class, np.integer)
+            and 0 <= int(positive_class) < y_score.shape[1]
+        ):
+            positive_column = int(positive_class)
+        else:
+            raise ValueError(
+                "Two-class subsets of multiclass scores require encoded "
+                "integer labels."
+            )
+        roc_auc = roc_auc_score(y_true, y_score[:, positive_column])
+    else:  # Multi-class classification, using One-vs-One strategy
         # Check if some classes in y_score are not present in y_true
         if len(classes_in_test) != y_score.shape[1]:
             logger.warning(f"Classes in test set: {classes_in_test}, classes in y_score: {y_score.shape[1]}")
