@@ -10,6 +10,58 @@ from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OrdinalEncoder, FunctionTransformer
 
 
+_BINARY_SCAN_WORKING_SET_BYTES = 64 * 1024**2
+
+
+def _binary_column_counts(X: np.ndarray):
+    n_samples, n_features = X.shape
+    chunk_size = max(
+        1,
+        _BINARY_SCAN_WORKING_SET_BYTES // max(1, n_samples),
+    )
+    is_binary = np.empty(n_features, dtype=bool)
+    zero_counts = np.empty(n_features, dtype=np.int64)
+    one_counts = np.empty(n_features, dtype=np.int64)
+    if n_samples == 0:
+        is_binary.fill(False)
+        zero_counts.fill(0)
+        one_counts.fill(0)
+        return is_binary, zero_counts, one_counts
+
+    floating = np.issubdtype(X.dtype, np.floating)
+    for start in range(0, n_features, chunk_size):
+        end = min(start + chunk_size, n_features)
+        chunk = X[:, start:end]
+        valid = chunk == 0
+        zero_counts[start:end] = np.count_nonzero(valid, axis=0)
+        ones = chunk == 1
+        one_counts[start:end] = np.count_nonzero(ones, axis=0)
+        valid |= ones
+        if floating:
+            valid |= np.isnan(chunk)
+        is_binary[start:end] = np.all(valid, axis=0)
+
+    return is_binary, zero_counts, one_counts
+
+
+def _binary_quantile(
+    zero_counts: np.ndarray,
+    one_counts: np.ndarray,
+    quantile: float,
+) -> np.ndarray:
+    valid_counts = zero_counts + one_counts
+    positions = (valid_counts - 1) * quantile
+    lower = np.floor(positions)
+    upper = np.ceil(positions)
+    lower_values = (lower >= zero_counts).astype(float)
+    upper_values = (upper >= zero_counts).astype(float)
+    values = lower_values + (upper_values - lower_values) * (
+        positions - lower
+    )
+    values[valid_counts == 0] = np.nan
+    return values
+
+
 def to_numeric_coerce(
     df: pd.DataFrame,
     *,
@@ -194,22 +246,63 @@ class RobustScaleSmoothClipTransform(BaseEstimator, TransformerMixin):
         # ndarray only
         assert isinstance(X, np.ndarray) and X.ndim == 2
 
-        # NaN-aware statistics across samples (axis -2 == 0 for 2D)
-        med = np.nanmedian(X, axis=-2)
-        if X.shape[0] == 0 or X.shape[1] == 0:
-            q75 = np.nanquantile(X, 0.75, axis=-2)
-            q25 = np.nanquantile(X, 0.25, axis=-2)
-        else:
-            quantiles = np.nanquantile(X, [0.25, 0.75], axis=-2)
-            if np.issubdtype(X.dtype, np.floating) and X.dtype.itemsize < 8:
-                # Vector quantiles promote float16/float32 to float64, unlike
-                # scalar quantiles. Preserve the existing rounding behavior.
-                quantiles = quantiles.astype(X.dtype, copy=False)
-            q25, q75 = quantiles
-        iqr = q75 - q25
+        is_binary, zero_counts, one_counts = _binary_column_counts(X)
+        stats_dtype = (
+            X.dtype
+            if np.issubdtype(X.dtype, np.floating) and X.dtype.itemsize < 8
+            else np.float64
+        )
+        med = np.empty(X.shape[1], dtype=stats_dtype)
+        q25 = np.empty(X.shape[1], dtype=stats_dtype)
+        q75 = np.empty(X.shape[1], dtype=stats_dtype)
+        width = np.empty(X.shape[1], dtype=stats_dtype)
 
-        # fallback width when IQR is zero or NaN
-        width = 0.5 * (np.nanmax(X, axis=-2) - np.nanmin(X, axis=-2))
+        if np.any(is_binary):
+            binary_zero = zero_counts[is_binary]
+            binary_one = one_counts[is_binary]
+            med[is_binary] = _binary_quantile(binary_zero, binary_one, 0.5)
+            q25[is_binary] = _binary_quantile(binary_zero, binary_one, 0.25)
+            q75[is_binary] = _binary_quantile(binary_zero, binary_one, 0.75)
+            binary_valid = binary_zero + binary_one
+            binary_width = (
+                0.5 * ((binary_zero > 0) & (binary_one > 0))
+            ).astype(float)
+            binary_width[binary_valid == 0] = np.nan
+            width[is_binary] = binary_width
+
+        nonbinary = ~is_binary
+        if np.any(nonbinary):
+            X_nonbinary = X[:, nonbinary]
+            med[nonbinary] = np.nanmedian(X_nonbinary, axis=-2)
+            if X.shape[0] == 0:
+                q75[nonbinary] = np.nanquantile(
+                    X_nonbinary,
+                    0.75,
+                    axis=-2,
+                )
+                q25[nonbinary] = np.nanquantile(
+                    X_nonbinary,
+                    0.25,
+                    axis=-2,
+                )
+            else:
+                quantiles = np.nanquantile(
+                    X_nonbinary,
+                    [0.25, 0.75],
+                    axis=-2,
+                )
+                if (
+                    np.issubdtype(X.dtype, np.floating)
+                    and X.dtype.itemsize < 8
+                ):
+                    quantiles = quantiles.astype(X.dtype, copy=False)
+                q25[nonbinary], q75[nonbinary] = quantiles
+            width[nonbinary] = 0.5 * (
+                np.nanmax(X_nonbinary, axis=-2)
+                - np.nanmin(X_nonbinary, axis=-2)
+            )
+
+        iqr = q75 - q25
 
         # choose denominator: prefer IQR, otherwise width
         use_iqr = np.isfinite(iqr) & (iqr != 0.0)
