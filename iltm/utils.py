@@ -960,6 +960,12 @@ def fine_tune_main_network(
     # init
     best_model_wts = copy.deepcopy(main_model.state_dict())
 
+    def update_best_model_wts():
+        current_state = main_model.state_dict()
+        with torch.no_grad():
+            for name, value in current_state.items():
+                best_model_wts[name].copy_(value)
+
     es = {
         "best_val_metric": float("inf") if lower_is_better else -float("inf"),
         "checks_no_improve": 0,
@@ -985,7 +991,7 @@ def fine_tune_main_network(
         improved = is_better(val_metric, es["best_val_metric"])
         if improved:
             es["best_val_metric"] = val_metric
-            es["best_model_wts"] = copy.deepcopy(main_model.state_dict())
+            update_best_model_wts()
             es["checks_no_improve"] = 0
             es["checks_since_improve"] = 0
             es["cooldown_left"] = cooldown_checks

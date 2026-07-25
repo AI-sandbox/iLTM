@@ -37,6 +37,36 @@ class _PlateauModel(torch.nn.Module):
         }
 
 
+class _OvershootingModel(torch.nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor(0.0))
+        self.initial_transformations_finetuning = True
+        self.training_weights = []
+
+    def forward(
+        self,
+        X,
+        X_ctxt_superset=None,
+        y_ctxt_superset=None,
+        training=False,
+    ):
+        if training:
+            self.training_weights.append(self.weight.item())
+            return self.weight.expand(len(X))
+        return self.weight.detach().expand(len(X))
+
+    def get_main_network_parts(self):
+        return {
+            "rf": None,
+            "pca": None,
+            "main_network": [],
+            "norm": None,
+            "training_weights": self.training_weights,
+            "restored_weight": self.weight.item(),
+        }
+
+
 def _run_plateau(
     monkeypatch,
     *,
@@ -128,3 +158,54 @@ def test_epoch_subset_keeps_full_training_tensors(monkeypatch):
     assert isinstance(dataset, torch.utils.data.Subset)
     assert len(dataset) == 4
     assert len(dataset.dataset) == 9
+
+
+def test_best_weights_reuse_the_initial_state_storage(monkeypatch):
+    original_deepcopy = iltm_utils.copy.deepcopy
+    calls = 0
+
+    def count_deepcopy(value, *args, **kwargs):
+        nonlocal calls
+        if hasattr(value, "keys") and "weight" in value:
+            calls += 1
+        return original_deepcopy(value, *args, **kwargs)
+
+    monkeypatch.setattr(iltm_utils.copy, "deepcopy", count_deepcopy)
+
+    _run_plateau(monkeypatch, cap=3)
+
+    assert calls == 1
+
+
+def test_best_weights_are_restored_after_training_overshoots(monkeypatch):
+    monkeypatch.setattr(
+        iltm_utils,
+        "MainNetworkTrainable",
+        _OvershootingModel,
+    )
+
+    result = iltm_utils.fine_tune_main_network(
+        cfg={},
+        X=torch.zeros(1, 1),
+        y=torch.ones(1),
+        n_classes=1,
+        rf=None,
+        pca=None,
+        main_network=[],
+        norm=None,
+        device=torch.device("cpu"),
+        max_epochs=3,
+        batch_size=1,
+        finetuning_optimizer="sgd",
+        finetuning_lr=0.1,
+        X_val=torch.zeros(1, 1),
+        y_val=torch.full((1,), 0.1),
+        finetuning_val_frac=0.0,
+        early_stopping_mode="epoch",
+        patience_epochs=99,
+        finetuning_subset_max_samples=None,
+        val_max_samples=None,
+    )
+
+    assert max(result["training_weights"]) > 0.15
+    assert result["restored_weight"] == pytest.approx(0.1, abs=1e-5)
