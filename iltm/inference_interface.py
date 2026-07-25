@@ -2118,14 +2118,18 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         # Regression has one output
         self.n_outputs_ = 1
         
-        result = self._fit_common(
-            X, y_proc,
-            eval_set=eval_set_proc,
-            n_outputs=self.n_outputs_,
-            fit_deadline=fit_deadline,
-            fit_time_cushion_frac=fit_time_cushion_frac,
-            return_partial_on_timeout=return_partial_on_timeout,
-        )
+        try:
+            result = self._fit_common(
+                X, y_proc,
+                eval_set=eval_set_proc,
+                n_outputs=self.n_outputs_,
+                fit_deadline=fit_deadline,
+                fit_time_cushion_frac=fit_time_cushion_frac,
+                return_partial_on_timeout=return_partial_on_timeout,
+            )
+        except BaseException:
+            self._release_training_model()
+            raise
         fit_total_end = time.time()
         fit_total_duration = fit_total_end - fit_start_time
         logger.debug(f"iLTMRegressor.fit END: Total fit duration={fit_total_duration:.2f}s")
@@ -2352,14 +2356,18 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
                 )
                 eval_set = eval_X, eval_y_proc
 
-        result = self._fit_common(
-            X, y_proc,
-            eval_set=eval_set,
-            n_outputs=self.n_outputs_,
-            fit_deadline=fit_deadline,
-            fit_time_cushion_frac=fit_time_cushion_frac,
-            return_partial_on_timeout=return_partial_on_timeout,
-        )
+        try:
+            result = self._fit_common(
+                X, y_proc,
+                eval_set=eval_set,
+                n_outputs=self.n_outputs_,
+                fit_deadline=fit_deadline,
+                fit_time_cushion_frac=fit_time_cushion_frac,
+                return_partial_on_timeout=return_partial_on_timeout,
+            )
+        except BaseException:
+            self._release_training_model()
+            raise
         fit_total_end = time.time()
         fit_total_duration = fit_total_end - fit_start_time
         logger.debug(f"iLTMClassifier.fit END: Total fit duration={fit_total_duration:.2f}s")

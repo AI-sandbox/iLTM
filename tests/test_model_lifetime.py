@@ -3,9 +3,10 @@ import subprocess
 import sys
 
 import numpy as np
+import pytest
 import torch
 
-from iltm import iLTMClassifier
+from iltm import iLTMClassifier, iLTMRegressor
 
 
 class IdentityPCA(torch.nn.Module):
@@ -132,6 +133,61 @@ def test_fit_releases_training_model_and_preserves_predictions(monkeypatch):
         predictions_after_release,
         predictions_before_release[0],
     )
+
+
+@pytest.mark.parametrize(
+    ("estimator_class", "y"),
+    [
+        (iLTMClassifier, np.array([0, 0, 1, 1])),
+        (iLTMRegressor, np.array([0.0, 0.5, 1.0, 1.5])),
+    ],
+)
+def test_failed_fit_releases_cached_training_model(
+    monkeypatch,
+    estimator_class,
+    y,
+):
+    estimator = estimator_class(
+        checkpoint=None,
+        device="cpu",
+        n_ensemble=1,
+        n_dims=2,
+        preprocessing="none",
+        corr_select_k=0,
+        finetuning=False,
+        adaptive_memory=False,
+    )
+    estimator.checkpoint = "/unused/local-checkpoint.pth"
+    estimator.model_path = estimator.checkpoint
+    monkeypatch.setattr(type(estimator), "_model_cache", {})
+
+    training_model = RecordingTrainingModel()
+    cache_key = ("failed-fit-cache-entry",)
+
+    def initialize_model():
+        estimator._model_cache[cache_key] = training_model
+        return training_model
+
+    def fail_predictor_generation(*args, **kwargs):
+        raise RuntimeError("synthetic fit failure")
+
+    monkeypatch.setattr(estimator, "_initialize_model", initialize_model)
+    monkeypatch.setattr(
+        estimator,
+        "_generate_predictor",
+        fail_predictor_generation,
+    )
+    X = np.array(
+        [[-1.0, 0.5], [0.0, 1.0], [1.0, -0.5], [2.0, 0.25]],
+        dtype=np.float32,
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic fit failure"):
+        estimator.fit(X, y)
+
+    assert estimator._model is None
+    assert estimator._model_cache[cache_key] is training_model
+    assert training_model.moves == ["cpu"]
 
 
 def test_cached_training_model_moves_back_to_requested_device(monkeypatch):
