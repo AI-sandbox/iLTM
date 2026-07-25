@@ -73,6 +73,15 @@ class TestSearchSpaceDefinition:
         space = get_hyperparameter_search_space(available_checkpoints=custom)
         assert space["checkpoint"]["choices"] == custom
 
+    def test_regression_prediction_clipping_is_preferred_but_optional(self):
+        space = get_hyperparameter_search_space()
+
+        assert space["clip_predictions"] == {
+            "type": "categorical",
+            "choices": [False, True],
+            "probs": [0.3, 0.7],
+        }
+
     def test_corr_select_k_excludes_aggressive_small_positive_cutoffs(self):
         spec = get_hyperparameter_search_space()["corr_select_k"]
 
@@ -121,6 +130,18 @@ class TestSearchSpaceDefinition:
                 2 / 93,
             ]
         )
+
+    @pytest.mark.parametrize("requested", [False, True])
+    def test_classifier_ignores_regression_prediction_clipping(self, requested):
+        classifier = iLTMClassifier(
+            checkpoint=None,
+            device="cpu",
+            clip_predictions=requested,
+        )
+
+        assert classifier.clip_predictions is False
+        assert classifier.get_params()["clip_predictions"] is False
+
 
 class TestSampleHyperparameters:
     """Tests for the sampling helper that draws configs from the space."""

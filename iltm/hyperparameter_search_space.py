@@ -197,7 +197,11 @@ def get_hyperparameter_search_space(
         "rf_size": {"type": "constant", "value": 32_768},
         "pca_sampling": {"type": "constant", "value": "zeropad"},
         "scheduler_min_lr": {"type": "log_uniform", "low": 1e-7, "high": 3e-4},
-        "clip_predictions": {"type": "categorical", "choices": [False, True]},
+        "clip_predictions": {
+            "type": "categorical",
+            "choices": [False, True],
+            "probs": [0.3, 0.7],
+        },
         "corr_select_k": {
             "type": "categorical",
             "choices": [0, 50, 100, 200, 300, 400, 512, 1024, 2048, 4096],
