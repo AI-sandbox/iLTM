@@ -46,6 +46,9 @@ from .model_checkpoints import resolve_model_checkpoint
 torch.set_float32_matmul_precision("high")  # enables TF32 on Ampere+
 torch.backends.cuda.matmul.allow_tf32 = True
 
+logger = logging.getLogger(__name__)
+
+
 class PermutationImportanceMixin:
     """
     Adds feature_importance to iLTM estimators using permutation importance on ORIGINAL features.
@@ -235,8 +238,6 @@ class _iLTMBase(BaseEstimator):
         # Logging
         self.logging_level = logging_level
         setup_logging(logging_level=self.logging_level)
-        global logger
-        logger = logging.getLogger(__name__)
 
         # Resolve model checkpoint config if provided
         if checkpoint is not None:

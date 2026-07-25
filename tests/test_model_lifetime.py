@@ -1,4 +1,6 @@
 import pickle
+import subprocess
+import sys
 
 import numpy as np
 import torch
@@ -190,3 +192,37 @@ def test_serialization_excludes_training_model_and_preserves_predictions():
     assert restored._model is None
     assert len(serialized) < 1_000_000
     np.testing.assert_allclose(predictions_after, predictions_before)
+
+
+def test_unpickled_estimator_can_log_in_fresh_process(tmp_path):
+    classifier = iLTMClassifier(
+        checkpoint=None,
+        device="cpu",
+        preprocessing="none",
+        n_dims=2,
+        corr_select_k=0,
+    )
+    model_path = tmp_path / "classifier.pkl"
+    with model_path.open("wb") as model_file:
+        pickle.dump(classifier, model_file)
+
+    script = """
+import pickle
+import sys
+import numpy as np
+
+with open(sys.argv[1], "rb") as model_file:
+    classifier = pickle.load(model_file)
+result = classifier._preprocess_test_data(
+    np.array([[1.0, 2.0]], dtype=np.float32),
+    {"corr_selected_indices": None},
+)
+assert tuple(result.shape) == (1, 2)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(model_path)],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
