@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import torch
 
-from iltm import iLTMClassifier
+from iltm import iLTMClassifier, iLTMRegressor
 
 
 class _TrainingModel(torch.nn.Module):
@@ -50,3 +50,37 @@ def test_fit_rejects_empty_ensemble_without_timeout(monkeypatch):
 
     assert classifier.predictors_ == []
     assert classifier._model is None
+
+
+@pytest.mark.parametrize(
+    ("estimator_class", "y"),
+    [
+        (iLTMClassifier, np.array([0, 1])),
+        (iLTMRegressor, np.array([0.0, 1.0])),
+    ],
+)
+def test_zero_fit_budget_times_out_immediately(estimator_class, y):
+    estimator = estimator_class(checkpoint=None, device="cpu")
+    X = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32)
+
+    with pytest.raises(TimeoutError, match="before fitting could start"):
+        estimator.fit(X, y, fit_max_time=0)
+
+    assert estimator.predictors_ == []
+    assert estimator._model is None
+
+
+@pytest.mark.parametrize("fit_max_time", [-1.0, np.inf, np.nan])
+@pytest.mark.parametrize(
+    ("estimator_class", "y"),
+    [
+        (iLTMClassifier, np.array([0, 1])),
+        (iLTMRegressor, np.array([0.0, 1.0])),
+    ],
+)
+def test_invalid_fit_budget_is_rejected(estimator_class, y, fit_max_time):
+    estimator = estimator_class(checkpoint=None, device="cpu")
+    X = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        estimator.fit(X, y, fit_max_time=fit_max_time)

@@ -2104,7 +2104,9 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         eval_set : tuple or None
             Optional validation set as a tuple (X_val, y_val).
         fit_max_time : float or None
-            Maximum time in seconds to allow for fitting. If None, no time limit is applied.
+            Maximum time in seconds to allow for fitting. If None, no time
+            limit is applied. Zero raises ``TimeoutError`` immediately;
+            negative and non-finite values are invalid.
         fit_time_cushion_frac : float
             Fractional time cushion to add when checking for time budget during ensemble generation.
             Used to estimate if there's enough time for the next predictor.
@@ -2121,9 +2123,16 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         """
         self._invalidate_fitted_state()
         fit_start_time = time.time()
-        if fit_max_time:
-            reserved_time = max(float(fit_max_time) * fit_time_margin_frac, float(fit_time_margin_min_seconds))
-            effective_fit_time = max(0.0, float(fit_max_time) - reserved_time)
+        if fit_max_time is not None:
+            fit_max_time = float(fit_max_time)
+            if not math.isfinite(fit_max_time) or fit_max_time < 0:
+                raise ValueError("fit_max_time must be finite and non-negative.")
+            if fit_max_time == 0:
+                raise TimeoutError(
+                    "iLTM fit time budget expired before fitting could start."
+                )
+            reserved_time = max(fit_max_time * fit_time_margin_frac, float(fit_time_margin_min_seconds))
+            effective_fit_time = max(0.0, fit_max_time - reserved_time)
             fit_deadline = fit_start_time + effective_fit_time
             logger.debug(f"iLTMRegressor.fit START: fit_max_time={fit_max_time:.2f}s, reserved_margin={reserved_time:.2f}s (frac={fit_time_margin_frac:.3f}, min={fit_time_margin_min_seconds:.2f}), effective_time={effective_fit_time:.2f}s")
         else:
@@ -2406,7 +2415,9 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         eval_set : tuple or None
             Optional validation set as a tuple (X_val, y_val).
         fit_max_time : float or None
-            Maximum time in seconds to allow for fitting. If None, no time limit is applied.
+            Maximum time in seconds to allow for fitting. If None, no time
+            limit is applied. Zero raises ``TimeoutError`` immediately;
+            negative and non-finite values are invalid.
         fit_time_cushion_frac : float
             Fractional time cushion to add when checking for time budget during ensemble generation.
             Used to estimate if there's enough time for the next predictor.
@@ -2423,9 +2434,16 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         """
         self._invalidate_fitted_state()
         fit_start_time = time.time()
-        if fit_max_time:
-            reserved_time = max(float(fit_max_time) * fit_time_margin_frac, float(fit_time_margin_min_seconds))
-            effective_fit_time = max(0.0, float(fit_max_time) - reserved_time)
+        if fit_max_time is not None:
+            fit_max_time = float(fit_max_time)
+            if not math.isfinite(fit_max_time) or fit_max_time < 0:
+                raise ValueError("fit_max_time must be finite and non-negative.")
+            if fit_max_time == 0:
+                raise TimeoutError(
+                    "iLTM fit time budget expired before fitting could start."
+                )
+            reserved_time = max(fit_max_time * fit_time_margin_frac, float(fit_time_margin_min_seconds))
+            effective_fit_time = max(0.0, fit_max_time - reserved_time)
             fit_deadline = fit_start_time + effective_fit_time
             logger.debug(f"iLTMClassifier.fit START: fit_max_time={fit_max_time:.2f}s, reserved_margin={reserved_time:.2f}s (frac={fit_time_margin_frac:.3f}, min={fit_time_margin_min_seconds:.2f}), effective_time={effective_fit_time:.2f}s")
         else:
