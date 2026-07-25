@@ -1576,8 +1576,7 @@ def is_cuda_oom(err: BaseException) -> bool:
         "not enough memory",
         "insufficient memory",
         "tree-ctr",
-        "cuda"
-        "tried to allocate"
+        "tried to allocate",
     ]
     return any(t in msg for t in triggers)
 

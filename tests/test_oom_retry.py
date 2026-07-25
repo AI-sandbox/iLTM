@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import types
 
+import pytest
 import torch
 
 import iltm.inference_interface as inference_interface
@@ -98,3 +99,20 @@ def test_oom_retry_discards_outputs_from_failed_attempt(monkeypatch):
     ]
     assert cache_clears == [None]
     assert moves == ["device", "cpu"]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "CUDA out of memory",
+        "Tried to allocate 2.00 GiB",
+    ],
+)
+def test_cuda_oom_signatures_are_recognized(message):
+    assert iltm_utils.is_cuda_oom(RuntimeError(message))
+
+
+def test_unrelated_cuda_error_is_not_treated_as_oom():
+    error = RuntimeError("CUDA error: invalid device ordinal")
+
+    assert not iltm_utils.is_cuda_oom(error)
