@@ -288,25 +288,75 @@ def forward_main_network_with_preprocessing(X, model_cfg, rf, pca, norm, main_ne
     return outputs, intermediate_state
 
 
+def prepare_retrieval_context(
+    X_ctxt,
+    y_ctxt,
+    n_classes,
+    model_cfg,
+    rf,
+    pca,
+    norm,
+    main_network,
+    device,
+    use_amp=False,
+    batch_size: int | None = None,
+) -> tuple[Tensor, Tensor]:
+    y_ctxt = y_ctxt.to(device)
+    if n_classes > 1:
+        y_ctxt = F.one_hot(y_ctxt, num_classes=n_classes).float()
+    else:
+        y_ctxt = y_ctxt.unsqueeze(-1)
+
+    if batch_size is None:
+        batch_size = len(y_ctxt)
+    batch_size = max(1, int(batch_size))
+    embeddings = []
+    for start in range(0, len(y_ctxt), batch_size):
+        end = min(start + batch_size, len(y_ctxt))
+        if isinstance(X_ctxt, dict):
+            X_batch = {
+                key: value[start:end].to(device)
+                for key, value in X_ctxt.items()
+            }
+        else:
+            X_batch = X_ctxt[start:end].to(device)
+        _, embedding = forward_main_network_with_preprocessing(
+            X_batch,
+            model_cfg,
+            rf,
+            pca,
+            norm,
+            main_network,
+            device,
+            use_amp,
+        )
+        embeddings.append(embedding)
+    return torch.cat(embeddings, dim=0), y_ctxt
+
+
 def retrieval(X_ctxt_superset, y_ctxt_superset, intermediate_state, n_classes, batch_size, distance_type, temperature,
               model_cfg, rf, pca, norm, main_network, device, use_amp=False,
-              training_finetuning: bool = False, finetuning_dropout: float = 0.0) -> Tensor:
+              training_finetuning: bool = False, finetuning_dropout: float = 0.0,
+              prepared_context: tuple[Tensor, Tensor] | None = None) -> Tensor:
     # Based on ModernNCA code: https://github.com/qile2000/LAMDA-TALENT/blob/main/LAMDA_TALENT/model/methods/modernNCA.py
-    X_ctxt, y_ctxt = sample_data(X_ctxt_superset, y_ctxt_superset, to_meta_model=False, batch_size=batch_size)  # stochastic neighbor sampling
-    if isinstance(X_ctxt, dict):
-        X_ctxt = {
-            'x_num': X_ctxt['x_num'].to(device),
-            'x_cat': X_ctxt['x_cat'].to(device)
-        }
+    if prepared_context is None:
+        X_ctxt, y_ctxt = sample_data(X_ctxt_superset, y_ctxt_superset, to_meta_model=False, batch_size=batch_size)  # stochastic neighbor sampling
+        if isinstance(X_ctxt, dict):
+            X_ctxt = {
+                'x_num': X_ctxt['x_num'].to(device),
+                'x_cat': X_ctxt['x_cat'].to(device)
+            }
+        else:
+            X_ctxt = X_ctxt.to(device)
+        y_ctxt = y_ctxt.to(device)
+        if n_classes > 1:  # n_classes == 1 for regression
+            y_ctxt = F.one_hot(y_ctxt, num_classes=n_classes).float()
+        else:  # n_classes == 1 for regression, but y_ctxt is a 1D tensor
+            y_ctxt = y_ctxt.unsqueeze(-1)
+        _, X_ctxt = forward_main_network_with_preprocessing(X_ctxt, model_cfg, rf, pca, norm, main_network, device, use_amp,
+                                                            training_finetuning=training_finetuning, finetuning_dropout=finetuning_dropout)
     else:
-        X_ctxt = X_ctxt.to(device)
-    y_ctxt = y_ctxt.to(device)
-    if n_classes > 1:  # n_classes == 1 for regression
-        y_ctxt = F.one_hot(y_ctxt, num_classes=n_classes).float()
-    else:  # n_classes == 1 for regression, but y_ctxt is a 1D tensor
-        y_ctxt = y_ctxt.unsqueeze(-1)
-    _, X_ctxt = forward_main_network_with_preprocessing(X_ctxt, model_cfg, rf, pca, norm, main_network, device, use_amp,
-                                                        training_finetuning=training_finetuning, finetuning_dropout=finetuning_dropout)
+        X_ctxt, y_ctxt = prepared_context
 
     if distance_type == 'euclidean':
         distances = torch.cdist(intermediate_state, X_ctxt, p=2)
@@ -330,7 +380,8 @@ def full_main_forward(X_grad, n_classes, batch_size, model_cfg,
                       rf, pca, norm, main_network, device, use_amp,
                       do_retrieval: bool = False, X_ctxt_superset: Tensor | None = None, y_ctxt_superset: Tensor | None = None,
                       retrieval_alpha: float = 0.5, retrieval_temperature: float = 1.0, retrieval_distance: str = 'cosine',
-                      training_finetuning: bool = False, finetuning_dropout: float = 0.0) -> Tensor:
+                      training_finetuning: bool = False, finetuning_dropout: float = 0.0,
+                      prepared_retrieval_context: tuple[Tensor, Tensor] | None = None) -> Tensor:
 
     if do_retrieval:
         use_amp = False
@@ -346,6 +397,7 @@ def full_main_forward(X_grad, n_classes, batch_size, model_cfg,
             batch_size, retrieval_distance, retrieval_temperature,
             model_cfg, rf, pca, norm, main_network, device, use_amp=use_amp,
             training_finetuning=training_finetuning, finetuning_dropout=finetuning_dropout,
+            prepared_context=prepared_retrieval_context,
         )
         outputs = (1 - retrieval_alpha) * outputs + retrieval_alpha * retrieval_outputs
 

@@ -30,6 +30,7 @@ from iltm.realmlp_td_s_preprocessing import get_realmlp_td_s_pipeline_separated
 from iltm.utils import (
     seed_everything,
     full_main_forward,
+    prepare_retrieval_context,
     fine_tune_main_network,
     standardize_column_dtypes,
     check_stratification,
@@ -1434,6 +1435,22 @@ class _iLTMBase(BaseEstimator):
             if X_ctxt_superset_concat is not None:
                 X_ctxt_superset_concat = X_ctxt_superset_concat[:, feature_bagging_idxs]
 
+        prepared_retrieval_context = None
+        if do_retrieval:
+            prepared_retrieval_context = prepare_retrieval_context(
+                X_ctxt_superset_concat,
+                y_ctxt_superset,
+                n_outputs,
+                self._get_inference_model_config(),
+                rf,
+                pca,
+                norm,
+                main_network,
+                self.device,
+                False,
+                batch_size=self.batch_size,
+            )
+
         ds = torch.utils.data.TensorDataset(X_concat)
         bs = int(self.batch_size)
         outs = []
@@ -1452,6 +1469,7 @@ class _iLTMBase(BaseEstimator):
                         rf, pca, norm, main_network, self.device, self.use_amp_inference,
                         do_retrieval, X_ctxt_superset_concat, y_ctxt_superset,
                         retrieval_alpha, retrieval_temperature, retrieval_distance,
+                        prepared_retrieval_context=prepared_retrieval_context,
                     )
                     outs.append(out)
                 break  # success
