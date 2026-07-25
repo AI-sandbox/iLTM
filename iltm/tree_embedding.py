@@ -240,9 +240,10 @@ class TreeEmbedding:
         if self.tree_model == 'GB':
             params = {
                 "random_state": self.seed,
-                "validation_fraction": self.eval_size if self.select_best_model else 0.0,
-                "n_iter_no_change": 50 if self.select_best_model else None,
             }
+            if self.select_best_model:
+                params["validation_fraction"] = self.eval_size
+                params["n_iter_no_change"] = 50
             if self.n_estimators is not None:
                 params["n_estimators"] = self.n_estimators
             if self.lr is not None:
