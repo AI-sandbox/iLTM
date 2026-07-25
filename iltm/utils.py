@@ -1636,9 +1636,11 @@ def compute_feature_target_correlations(X: np.ndarray, y: np.ndarray) -> np.ndar
     for start in range(0, X.shape[1], chunk_size):
         end = min(start + chunk_size, X.shape[1])
         X_chunk = np.asarray(X[:, start:end], dtype=float)
-        X_centered = X_chunk - X_chunk.mean(axis=0, keepdims=True)
-        numerator = (X_centered * y_centered.reshape(-1, 1)).sum(axis=0)
-        X_std = np.sqrt((X_centered**2).sum(axis=0))
+        if np.shares_memory(X_chunk, X):
+            X_chunk = X_chunk.copy()
+        X_chunk -= X_chunk.mean(axis=0, keepdims=True)
+        numerator = X_chunk.T @ y_centered
+        X_std = np.sqrt(np.einsum("ij,ij->j", X_chunk, X_chunk))
         denominator = X_std * y_std
         denominator[denominator == 0] = np.inf
         correlations[start:end] = numerator / denominator

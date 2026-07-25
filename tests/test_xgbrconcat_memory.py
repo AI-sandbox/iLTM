@@ -234,3 +234,14 @@ def test_correlations_match_full_width_reference_with_bounded_float64_cast(
     )
     assert float64_cast_widths
     assert max(float64_cast_widths) <= 3
+
+
+def test_correlations_do_not_mutate_float64_input():
+    rng = np.random.default_rng(23)
+    X = rng.normal(size=(37, 11))
+    y = rng.normal(size=37)
+    expected = X.copy()
+
+    iltm_utils.compute_feature_target_correlations(X, y)
+
+    np.testing.assert_array_equal(X, expected)
