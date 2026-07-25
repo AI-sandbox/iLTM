@@ -6,7 +6,13 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OrdinalEncoder, OneHotEncoder
 from sklearn.ensemble import GradientBoostingRegressor, RandomTreesEmbedding, GradientBoostingClassifier
-from .utils import preprocess_cat_features_for_catboost, get_gpu_memory_info, pick_gpu_ram_part, clear_cuda_cache
+from .utils import (
+    clear_cuda_cache,
+    get_gpu_memory_info,
+    is_cuda_oom,
+    pick_gpu_ram_part,
+    preprocess_cat_features_for_catboost,
+)
 
 
 import xgboost as xgb
@@ -428,8 +434,7 @@ class TreeEmbedding:
                     break
 
                 except Exception as e:
-                    msg = str(e).lower()
-                    if "out of memory" not in msg and "cuda" not in msg:
+                    if not is_cuda_oom(e):
                         raise
                     logger.warning("XGBoost OOM on attempt %d. Adapting and retrying.", attempt)
                     clear_cuda_cache()

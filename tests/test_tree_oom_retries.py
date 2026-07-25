@@ -65,6 +65,24 @@ def test_xgboost_oom_backoff_reraises_after_cpu_failure(monkeypatch):
     assert calls[-1]["device"] == "cpu"
 
 
+def test_xgboost_non_oom_cuda_error_is_not_retried(monkeypatch):
+    calls = []
+
+    def train(*, params, **kwargs):
+        calls.append(dict(params))
+        raise RuntimeError("CUDA error: invalid device ordinal")
+
+    monkeypatch.setattr(tree_embedding.xgb, "DMatrix", lambda *args, **kwargs: object())
+    monkeypatch.setattr(tree_embedding.xgb, "train", train)
+    monkeypatch.setattr(tree_embedding, "get_gpu_memory_info", lambda *args, **kwargs: None)
+
+    with pytest.raises(RuntimeError, match="invalid device ordinal"):
+        _tree("XGBoost_hist", "regression")._fit_model(*_data("regression"))
+
+    assert len(calls) == 1
+    assert calls[0]["device"] == "cuda:0"
+
+
 def test_catboost_oom_backoff_reaches_cpu(monkeypatch):
     calls = []
 
