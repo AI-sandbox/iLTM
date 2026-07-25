@@ -2153,7 +2153,8 @@ class iLTMRegressor(_iLTMBase, RegressorMixin, PermutationImportanceMixin):
         )
 
         if self.normalize_predictions_:
-            yhats = (yhats - yhats.mean()) / (yhats.std() + 1e-6)
+            prediction_std = yhats.std(unbiased=yhats.numel() > 1)
+            yhats = (yhats - yhats.mean()) / (prediction_std + 1e-6)
 
         if self.clip_predictions_:
             pred_min, pred_max = float(yhats.min()), float(yhats.max())

@@ -1,6 +1,7 @@
 import pytest
 import numpy as np
 import pandas as pd
+import torch
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score
 
@@ -154,6 +155,27 @@ class TestiLTMRegressorPreprocessing:
 
 
 class TestiLTMRegressorOptions:
+
+    def test_single_row_prediction_without_finetuning_is_finite(self, monkeypatch):
+        reg = iLTMRegressor(
+            checkpoint=None,
+            device="cpu",
+            finetuning=False,
+        )
+        reg.n_outputs_ = 1
+        reg.normalize_predictions_ = True
+        reg.clip_predictions_ = False
+        reg._y_mean = 7.0
+        reg._y_std = 2.0
+        monkeypatch.setattr(
+            reg,
+            "_predict_ensemble",
+            lambda *args, **kwargs: torch.tensor([3.0]),
+        )
+
+        prediction = reg.predict(np.array([[1.0, 2.0]], dtype=np.float32))
+
+        np.testing.assert_array_equal(prediction, np.array([7.0]))
     
     def test_no_finetuning(self, tiny_regression_data):
         X, y = tiny_regression_data
@@ -210,4 +232,3 @@ class TestiLTMRegressorOptions:
         assert isinstance(reg._y_mean, float)
         assert isinstance(reg._y_std, float)
         assert reg._y_std > 0
-
