@@ -14,6 +14,9 @@ from catboost import CatBoostRegressor, Pool, CatBoostClassifier
 logger = logging.getLogger(__name__)
 
 
+_DENSE_ONEHOT_WORKING_SET_BYTES = 64 * 1024**2
+
+
 class TreeEmbedding:
     def __init__(
         self,
@@ -675,16 +678,13 @@ class TreeEmbedding:
 
         if self.tree_model != 'RT':
             # Fit OneHotEncoder
-            self.onehot_encoder = OneHotEncoder(sparse_output=False, handle_unknown="ignore", dtype=np.int8).fit(emb)
+            self.onehot_encoder = OneHotEncoder(
+                sparse_output=False,
+                handle_unknown="ignore",
+                dtype=np.int8,
+            ).fit(emb)
 
             if self.onehot_max_features:
-                emb_oh = self.onehot_encoder.transform(emb)
-                # identify top features
-                feature_counts = emb_oh.sum(axis=0)
-                # Sort features by frequency and get their indices
-                sorted_feature_indices = np.argsort(feature_counts)[::-1]
-
-                # Select the top features
                 if concat_with_orig_features:
                     orig_feature_budget = 6144  # 75% for original features
                     n_orig_features = X.shape[1]
@@ -705,6 +705,24 @@ class TreeEmbedding:
                     self.n_orig_features_to_keep_ = None  # Not applicable
                     top_k_embeddings = 8192
 
+                n_onehot_features = sum(
+                    len(categories)
+                    for categories in self.onehot_encoder.categories_
+                )
+                self.onehot_encoder.set_params(
+                    sparse_output=(
+                        n_onehot_features > top_k_embeddings
+                        or emb.shape[0] * n_onehot_features
+                        > _DENSE_ONEHOT_WORKING_SET_BYTES
+                    )
+                )
+                emb_oh = self.onehot_encoder.transform(emb)
+                # identify top features
+                feature_counts = np.asarray(emb_oh.sum(axis=0)).ravel()
+                # Sort features by frequency and get their indices
+                sorted_feature_indices = np.argsort(feature_counts)[::-1]
+
+                # Select the top features
                 self.onehot_top_features_idx_ = sorted_feature_indices[:top_k_embeddings]
 
         logger.info(f"Tree model {self.tree_model} fitted successfully")
@@ -742,6 +760,8 @@ class TreeEmbedding:
                 if self.onehot_top_features_idx_ is None:
                     raise Exception("onehot_max_features is True, but the top features were not identified. Make sure to call fit_tree first.")
                 emb_oh = emb_oh[:, self.onehot_top_features_idx_]
+                if self.onehot_encoder.sparse_output:
+                    emb_oh = emb_oh.toarray()
                 logger.debug(f"Subsetting to the top {emb_oh.shape[1]} features. New shape: {emb_oh.shape}")
             
             return emb_oh
