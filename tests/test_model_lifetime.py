@@ -5,6 +5,7 @@ import sys
 import numpy as np
 import pytest
 import torch
+from sklearn.exceptions import NotFittedError
 
 from iltm import iLTMClassifier, iLTMRegressor
 
@@ -114,6 +115,7 @@ def test_fit_releases_training_model_and_preserves_predictions(monkeypatch):
     release_training_model = classifier._release_training_model
 
     def record_then_release():
+        classifier._fit_succeeded = True
         predictions_before_release.append(classifier.predict_proba(X_test))
         release_training_model()
 
@@ -121,6 +123,7 @@ def test_fit_releases_training_model_and_preserves_predictions(monkeypatch):
     classifier.fit(X_train, y_train)
     predictions_after_release = classifier.predict_proba(X_test)
 
+    assert classifier.__sklearn_is_fitted__()
     assert classifier._model is None
     assert classifier._model_cache[cache_key] is training_model
     assert training_model.moves[-1] == "cpu"
@@ -150,7 +153,7 @@ def test_failed_fit_releases_cached_training_model(
     estimator = estimator_class(
         checkpoint=None,
         device="cpu",
-        n_ensemble=1,
+        n_ensemble=2,
         n_dims=2,
         preprocessing="none",
         corr_select_k=0,
@@ -168,7 +171,13 @@ def test_failed_fit_releases_cached_training_model(
         estimator._model_cache[cache_key] = training_model
         return training_model
 
+    predictor_count = 0
+
     def fail_predictor_generation(*args, **kwargs):
+        nonlocal predictor_count
+        predictor_count += 1
+        if predictor_count == 1:
+            return _predictor()
         raise RuntimeError("synthetic fit failure")
 
     monkeypatch.setattr(estimator, "_initialize_model", initialize_model)
@@ -188,6 +197,21 @@ def test_failed_fit_releases_cached_training_model(
     assert estimator._model is None
     assert estimator._model_cache[cache_key] is training_model
     assert training_model.moves == ["cpu"]
+    assert predictor_count == 2
+    assert estimator.predictors_ == []
+    assert estimator.preprocessors_ == []
+    assert estimator.tr_ is None
+    assert not estimator.__sklearn_is_fitted__()
+    with pytest.raises(NotFittedError):
+        estimator.predict(X[:1])
+
+
+@pytest.mark.parametrize("estimator_class", [iLTMClassifier, iLTMRegressor])
+def test_new_estimator_is_not_fitted(estimator_class):
+    estimator = estimator_class(checkpoint=None, device="cpu")
+
+    with pytest.raises(NotFittedError):
+        estimator.predict(np.zeros((1, 2), dtype=np.float32))
 
 
 def test_cached_training_model_moves_back_to_requested_device(monkeypatch):
@@ -238,6 +262,7 @@ def test_serialization_excludes_training_model_and_preserves_predictions():
     classifier.predictors_ = [_predictor()]
     classifier._model = torch.nn.Linear(1024, 1024, bias=False)
     X = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    assert "_fit_succeeded" not in classifier.__dict__
     predictions_before = classifier.predict_proba(X)
 
     serialized = pickle.dumps(classifier)

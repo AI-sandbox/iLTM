@@ -631,6 +631,20 @@ class _iLTMBase(BaseEstimator):
         tags.input_tags.allow_nan = True
         return tags
 
+    def __sklearn_is_fitted__(self) -> bool:
+        fit_succeeded = getattr(self, "_fit_succeeded", None)
+        if fit_succeeded is not None:
+            return bool(fit_succeeded)
+        return bool(getattr(self, "predictors_", None)) and bool(
+            getattr(self, "preprocessors_", None)
+        )
+
+    def _invalidate_fitted_state(self) -> None:
+        self._fit_succeeded = False
+        self.predictors_ = []
+        self.preprocessors_ = []
+        self.tr_ = None
+
     def get_params(self, deep=True):
         params = super().get_params(deep=deep)
         # Ensure device is returned as string for sklearn clone compatibility
@@ -2083,6 +2097,7 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
             If True, if the time limit triggers during creation of an ensemble member,
             include that member using the best weights at the moment of timeout.
         """
+        self._invalidate_fitted_state()
         fit_start_time = time.time()
         if fit_max_time:
             reserved_time = max(float(fit_max_time) * fit_time_margin_frac, float(fit_time_margin_min_seconds))
@@ -2128,8 +2143,10 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
                 return_partial_on_timeout=return_partial_on_timeout,
             )
         except BaseException:
+            self._invalidate_fitted_state()
             self._release_training_model()
             raise
+        self._fit_succeeded = True
         fit_total_end = time.time()
         fit_total_duration = fit_total_end - fit_start_time
         logger.debug(f"iLTMRegressor.fit END: Total fit duration={fit_total_duration:.2f}s")
@@ -2303,6 +2320,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
             If True, if the time limit triggers during creation of an ensemble member,
             include that member using the best weights at the moment of timeout.
         """
+        self._invalidate_fitted_state()
         fit_start_time = time.time()
         if fit_max_time:
             reserved_time = max(float(fit_max_time) * fit_time_margin_frac, float(fit_time_margin_min_seconds))
@@ -2366,8 +2384,10 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
                 return_partial_on_timeout=return_partial_on_timeout,
             )
         except BaseException:
+            self._invalidate_fitted_state()
             self._release_training_model()
             raise
+        self._fit_succeeded = True
         fit_total_end = time.time()
         fit_total_duration = fit_total_end - fit_start_time
         logger.debug(f"iLTMClassifier.fit END: Total fit duration={fit_total_duration:.2f}s")
