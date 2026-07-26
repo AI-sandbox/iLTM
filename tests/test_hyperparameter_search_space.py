@@ -23,6 +23,29 @@ from iltm import (
 
 
 VALID_TYPES = {"constant", "categorical", "float_uniform", "log_uniform"}
+NON_TREE_CHECKPOINTS = {"r128bn", "rnobn", "rtr"}
+XGBOOST_CHECKPOINTS = {"xgb", "xgbrconcat"}
+CATBOOST_CHECKPOINTS = {"catb", "cbrconcat", "rtrcb"}
+COMMON_TREE_PARAMETERS = {
+    "tree_data_split",
+    "tree_for_each_predictor",
+    "tree_n_estimators",
+    "tree_lr",
+    "tree_max_depth",
+    "tree_min_samples_leaf",
+    "tree_l2_leaf_reg",
+}
+XGBOOST_PARAMETERS = {
+    "tree_subsample",
+    "tree_feature_fraction",
+    "tree_gamma",
+}
+CATBOOST_PARAMETERS = {"tree_bagging_temperature"}
+RETRIEVAL_PARAMETERS = {
+    "retrieval_alpha",
+    "retrieval_temperature",
+    "retrieval_distance",
+}
 
 
 class TestSearchSpaceDefinition:
@@ -72,6 +95,7 @@ class TestSearchSpaceDefinition:
         custom = ["xgbrconcat", "cbrconcat"]
         space = get_hyperparameter_search_space(available_checkpoints=custom)
         assert space["checkpoint"]["choices"] == custom
+        assert "probs" not in space["checkpoint"]
 
     def test_regression_prediction_clipping_is_preferred_but_optional(self):
         space = get_hyperparameter_search_space()
@@ -81,6 +105,55 @@ class TestSearchSpaceDefinition:
             "choices": [False, True],
             "probs": [0.3, 0.7],
         }
+
+    def test_time_aware_ranges_and_controls(self):
+        space = get_hyperparameter_search_space()
+
+        assert space["n_ensemble"]["choices"] == [4, 8, 12, 16, 32]
+        assert space["finetuning_batch_size"]["choices"] == [1024, 2048, 4096]
+        assert space["max_train_batches_per_epoch"]["value"] == 128
+        assert space["finetuning_subset_frac"]["value"] is None
+        assert space["finetuning_subset_max_samples"]["value"] == 100_000
+        assert space["val_max_samples"]["value"] == 25_000
+
+    def test_tree_ranges_include_current_default_regions(self):
+        space = get_hyperparameter_search_space()
+
+        assert space["tree_min_samples_leaf"]["choices"] == [
+            1,
+            2,
+            4,
+            8,
+            12,
+            16,
+            90,
+        ]
+        assert space["tree_min_samples_leaf"]["probs"] == [
+            0.15,
+            0.15,
+            0.15,
+            0.15,
+            0.15,
+            0.15,
+            0.10,
+        ]
+        assert space["tree_max_depth"]["probs"] == [0.20, 0.65, 0.15]
+        assert space["tree_gamma"]["choices"] == [
+            0.0,
+            0.05,
+            0.1,
+            0.25,
+            0.5,
+            1.5,
+        ]
+        assert space["tree_gamma"]["probs"] == [
+            0.54,
+            0.09,
+            0.09,
+            0.09,
+            0.09,
+            0.10,
+        ]
 
     def test_corr_select_k_excludes_aggressive_small_positive_cutoffs(self):
         spec = get_hyperparameter_search_space()["corr_select_k"]
@@ -153,8 +226,7 @@ class TestSampleHyperparameters:
         cfg = sample_hyperparameters(rng)
 
         assert isinstance(cfg, dict)
-        # Keys in config and space should match exactly
-        assert set(cfg.keys()) == set(space.keys())
+        assert set(cfg).issubset(space)
 
         # Some basic sanity checks
         assert cfg["checkpoint"] in AVAILABLE_CHECKPOINTS
@@ -167,6 +239,16 @@ class TestSampleHyperparameters:
         custom = ["xgbrconcat", "cbrconcat"]
         cfg = sample_hyperparameters(rng, available_checkpoints=custom)
         assert cfg["checkpoint"] in custom
+
+    def test_sample_accepts_arbitrary_checkpoint_paths(self):
+        checkpoint = "/tmp/custom_model.pth"
+        config = sample_hyperparameters(
+            np.random.default_rng(0),
+            available_checkpoints=[checkpoint],
+        )
+
+        assert config["checkpoint"] == checkpoint
+        assert not any(name.startswith("tree_") for name in config)
 
     def test_corr_select_k_uses_checkpoint_specific_choices(self):
         rng = np.random.default_rng(seed=7)
@@ -206,6 +288,89 @@ class TestSampleHyperparameters:
         assert cfg1 != cfg2
 
 
+class TestConditionalBranches:
+    @pytest.mark.parametrize("checkpoint", sorted(NON_TREE_CHECKPOINTS))
+    def test_non_tree_checkpoints_omit_tree_parameters(self, checkpoint):
+        config = sample_hyperparameters(
+            np.random.default_rng(0),
+            available_checkpoints=[checkpoint],
+        )
+
+        assert not any(name.startswith("tree_") for name in config)
+
+    @pytest.mark.parametrize("checkpoint", sorted(XGBOOST_CHECKPOINTS))
+    def test_xgboost_checkpoints_use_xgboost_parameters(self, checkpoint):
+        config = sample_hyperparameters(
+            np.random.default_rng(0),
+            available_checkpoints=[checkpoint],
+        )
+
+        assert COMMON_TREE_PARAMETERS | XGBOOST_PARAMETERS <= set(config)
+        assert CATBOOST_PARAMETERS.isdisjoint(config)
+
+    @pytest.mark.parametrize("checkpoint", sorted(CATBOOST_CHECKPOINTS))
+    def test_catboost_checkpoints_use_catboost_parameters(self, checkpoint):
+        config = sample_hyperparameters(
+            np.random.default_rng(0),
+            available_checkpoints=[checkpoint],
+        )
+
+        assert COMMON_TREE_PARAMETERS | CATBOOST_PARAMETERS <= set(config)
+        assert XGBOOST_PARAMETERS.isdisjoint(config)
+
+    @pytest.mark.parametrize("checkpoint", ["rtr", "rtrcb"])
+    def test_retrieval_checkpoints_force_retrieval(self, checkpoint):
+        config = sample_hyperparameters(
+            np.random.default_rng(0),
+            available_checkpoints=[checkpoint],
+        )
+
+        assert config["do_retrieval"] is True
+        assert RETRIEVAL_PARAMETERS <= set(config)
+
+    def test_retrieval_parameters_only_exist_when_enabled(self):
+        configs = [
+            sample_hyperparameters(
+                np.random.default_rng(seed),
+                available_checkpoints=["rnobn"],
+            )
+            for seed in range(20)
+        ]
+
+        assert {config["do_retrieval"] for config in configs} == {False, True}
+        for config in configs:
+            if config["do_retrieval"]:
+                assert RETRIEVAL_PARAMETERS <= set(config)
+            else:
+                assert RETRIEVAL_PARAMETERS.isdisjoint(config)
+
+    def test_space_describes_checkpoint_conditions(self):
+        space = get_hyperparameter_search_space()
+
+        assert set(space["tree_gamma"]["checkpoints"]) == XGBOOST_CHECKPOINTS
+        assert set(space["tree_bagging_temperature"]["checkpoints"]) == CATBOOST_CHECKPOINTS
+        assert set(space["tree_n_estimators"]["checkpoints"]) == (
+            XGBOOST_CHECKPOINTS | CATBOOST_CHECKPOINTS
+        )
+        assert space["retrieval_alpha"]["condition"] == {
+            "parameter": "do_retrieval",
+            "value": True,
+        }
+        assert set(space["do_retrieval"]["forced_true_checkpoints"]) == {
+            "rtr",
+            "rtrcb",
+        }
+
+    def test_space_conditions_respect_available_checkpoints(self):
+        space = get_hyperparameter_search_space(
+            available_checkpoints=["xgb", "rtr"],
+        )
+
+        assert space["tree_n_estimators"]["checkpoints"] == ["xgb"]
+        assert space["tree_gamma"]["checkpoints"] == ["xgb"]
+        assert space["tree_bagging_temperature"]["checkpoints"] == []
+        assert space["do_retrieval"]["forced_true_checkpoints"] == ["rtr"]
+
 class TestSampledConfigParameterRanges:
     """Test that sampled configurations fall inside the intended ranges."""
 
@@ -217,7 +382,7 @@ class TestSampledConfigParameterRanges:
             config = sample_hyperparameters(rng)
 
             # Check ensemble size
-            assert config["n_ensemble"] in [4, 8, 12, 16, 32, 64]
+            assert config["n_ensemble"] in [4, 8, 12, 16, 32]
 
             # Check batch size
             assert config["batch_size"] in [2048, 4096]
@@ -226,31 +391,46 @@ class TestSampledConfigParameterRanges:
             assert config["finetuning"] is True
             assert config["finetuning_dropout"] in [0.0, 0.15]
             assert config["finetuning_max_steps"] in [2048, 4096]
-            assert config["finetuning_batch_size"] in [64, 128, 256, 512, 1024, 2048, 4096]
+            assert config["finetuning_batch_size"] in [1024, 2048, 4096]
             assert 1e-4 <= config["finetuning_lr"] <= 3e-3
             assert 0.5 <= config["gradient_clip_norm"] <= 1.5
             assert config["finetuning_optimizer"] in ["adamw", "lion"]
+            assert config["max_train_batches_per_epoch"] == 128
+            assert config["finetuning_subset_frac"] is None
+            assert config["finetuning_subset_max_samples"] == 100_000
+            assert config["val_max_samples"] == 25_000
 
-            # Tree parameters
-            assert config["tree_data_split"] in ["dynamic", "all"]
-            assert config["tree_for_each_predictor"] is True
-            assert config["tree_n_estimators"] in [100, 125, 150, 200, 300]
-            assert 1e-3 <= config["tree_lr"] <= 1.0
-            assert config["tree_max_depth"] in [4, 5, 6]
-            assert config["tree_min_samples_leaf"] in [1, 2, 4, 8, 12, 16]
-            assert 0.5 <= config["tree_subsample"] <= 1.0
-            assert 0.6 <= config["tree_feature_fraction"] <= 1.0
-            assert config["tree_gamma"] in [0.0, 0.05, 0.1, 0.25, 0.5]
-            assert config["tree_l2_leaf_reg"] in [0.1, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 5]
-            assert 0.1 <= config["tree_bagging_temperature"] <= 1.0
-
-            # Retrieval parameters
             assert isinstance(config["do_retrieval"], bool)
-            assert 0.0 <= config["retrieval_alpha"] <= 1.0
-            assert 1.0 <= config["retrieval_temperature"] <= 2.5
-            assert config["retrieval_distance"] in ["cosine", "euclidean"]
             assert config["retrieval_alpha_finetuning"] is False
             assert config["retrieval_temperature_finetuning"] is False
+            if config["do_retrieval"]:
+                assert 0.0 <= config["retrieval_alpha"] <= 1.0
+                assert 1.0 <= config["retrieval_temperature"] <= 2.5
+                assert config["retrieval_distance"] in ["cosine", "euclidean"]
+            else:
+                assert RETRIEVAL_PARAMETERS.isdisjoint(config)
+
+            checkpoint = config["checkpoint"]
+            if checkpoint in NON_TREE_CHECKPOINTS:
+                assert not any(name.startswith("tree_") for name in config)
+            else:
+                assert config["tree_data_split"] in ["dynamic", "all"]
+                assert config["tree_for_each_predictor"] is True
+                assert config["tree_n_estimators"] in [100, 125, 150, 200, 300]
+                assert 1e-3 <= config["tree_lr"] <= 1.0
+                assert config["tree_max_depth"] in [4, 5, 6]
+                assert config["tree_min_samples_leaf"] in [1, 2, 4, 8, 12, 16, 90]
+                assert config["tree_l2_leaf_reg"] in [0.1, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 5]
+
+            if checkpoint in XGBOOST_CHECKPOINTS:
+                assert 0.5 <= config["tree_subsample"] <= 1.0
+                assert 0.6 <= config["tree_feature_fraction"] <= 1.0
+                assert config["tree_gamma"] in [0.0, 0.05, 0.1, 0.25, 0.5, 1.5]
+                assert CATBOOST_PARAMETERS.isdisjoint(config)
+
+            if checkpoint in CATBOOST_CHECKPOINTS:
+                assert 0.1 <= config["tree_bagging_temperature"] <= 1.0
+                assert XGBOOST_PARAMETERS.isdisjoint(config)
 
             # Other parameters
             assert config["device"] == "cuda:0"
