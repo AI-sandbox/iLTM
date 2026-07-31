@@ -1573,6 +1573,7 @@ def is_cuda_oom(err: BaseException) -> bool:
     """
     msg = str(err).lower()
     triggers = [
+        "out of memory",
         "cuda out of memory",
         "cupy.cuda.memory",
         "hip out of memory",

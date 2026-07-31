@@ -571,16 +571,7 @@ class TreeEmbedding:
                     break  # success
 
                 except Exception as e:
-                    msg = str(e).lower()
-                    # Catch the variety of CatBoost GPU OOM wordings
-                    oom_like = (
-                        "out of memory" in msg
-                        or "not enough memory" in msg
-                        or ("cuda" in msg and "memory" in msg)
-                        or ("tree-ctr" in msg and "memory" in msg)
-                        or ("insufficient memory" in msg)
-                    )
-                    if not oom_like:
+                    if not is_cuda_oom(e):
                         raise
                     logger.warning("CatBoost OOM on attempt %d. Adapting and retrying.", attempt)
                     clear_cuda_cache()

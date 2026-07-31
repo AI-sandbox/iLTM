@@ -1489,7 +1489,6 @@ class _iLTMBase(BaseEstimator):
                     outs.append(out)
                 break  # success
             except RuntimeError as e:
-                from iltm.utils import is_cuda_oom, clear_cuda_cache
                 if not is_cuda_oom(e) or bs <= 128:
                     raise
                 outs.clear()
