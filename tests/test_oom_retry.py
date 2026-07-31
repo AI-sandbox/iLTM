@@ -76,7 +76,7 @@ def test_oom_retry_discards_outputs_from_failed_attempt(monkeypatch):
         fail_after_one_batch,
     )
     monkeypatch.setattr(
-        iltm_utils,
+        inference_interface,
         "clear_cuda_cache",
         lambda: cache_clears.append(None),
     )
