@@ -253,7 +253,7 @@ def get_hyperparameter_search_space(
     space: SearchSpace = {
         "checkpoint": {"type": "categorical", "choices": available_checkpoints},
         "device": {"type": "constant", "value": "cuda:0"},
-        "n_ensemble": {"type": "categorical", "choices": [4, 8, 12, 16, 32]},
+        "n_ensemble": {"type": "categorical", "choices": [4, 8, 12, 16]},
         "batch_size": {"type": "categorical", "choices": [2048, 4096]},
         "finetuning": {"type": "constant", "value": True},
         "finetuning_dropout": {"type": "categorical", "choices": [0.0, 0.15]},

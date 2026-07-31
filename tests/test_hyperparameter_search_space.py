@@ -109,7 +109,7 @@ class TestSearchSpaceDefinition:
     def test_time_aware_ranges_and_controls(self):
         space = get_hyperparameter_search_space()
 
-        assert space["n_ensemble"]["choices"] == [4, 8, 12, 16, 32]
+        assert space["n_ensemble"]["choices"] == [4, 8, 12, 16]
         assert space["finetuning_batch_size"]["choices"] == [1024, 2048, 4096]
         assert space["max_train_batches_per_epoch"]["value"] == 128
         assert space["finetuning_subset_frac"]["value"] is None
@@ -382,7 +382,7 @@ class TestSampledConfigParameterRanges:
             config = sample_hyperparameters(rng)
 
             # Check ensemble size
-            assert config["n_ensemble"] in [4, 8, 12, 16, 32]
+            assert config["n_ensemble"] in [4, 8, 12, 16]
 
             # Check batch size
             assert config["batch_size"] in [2048, 4096]
