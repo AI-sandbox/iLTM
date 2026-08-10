@@ -637,12 +637,22 @@ class TreeEmbedding:
             # Clean infs and values too large (crashes)
             X = self._handle_inf_and_value_too_large(X)
             dtest = xgb.DMatrix(X, enable_categorical=True)
-            emb = self.model.predict(dtest, pred_leaf=True)
+            predict_kwargs = {}
+            if self.select_best_model:
+                best_iteration = getattr(self.model, 'best_iteration', None)
+                if best_iteration is not None:
+                    predict_kwargs['iteration_range'] = (0, int(best_iteration) + 1)
+            emb = self.model.predict(dtest, pred_leaf=True, **predict_kwargs)
 
         elif self.tree_model == 'CatBoost':
             X = preprocess_cat_features_for_catboost(X, self.cat_features)
-            test_pool = Pool(X, cat_features=self.cat_features) 
-            emb = self.model.calc_leaf_indexes(test_pool)
+            test_pool = Pool(X, cat_features=self.cat_features)
+            leaf_kwargs = {}
+            if self.select_best_model:
+                best_iteration = self.model.get_best_iteration()
+                if best_iteration is not None and best_iteration >= 0:
+                    leaf_kwargs['ntree_end'] = int(best_iteration) + 1
+            emb = self.model.calc_leaf_indexes(test_pool, **leaf_kwargs)
             del test_pool
             gc.collect()
 
