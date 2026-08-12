@@ -204,6 +204,7 @@ class _iLTMBase(BaseEstimator):
         tree_for_each_predictor: bool = True,
         tree_use_default_params: bool = False,
         tree_select_best_model: bool = True,
+        tree_use_external_eval_set: bool = False,
         concat_tree_with_orig_features: bool = False,
         tree_max_leaves: int | None = None,
         tree_gamma: float | None = 1.4598703125721042,
@@ -343,6 +344,7 @@ class _iLTMBase(BaseEstimator):
         self.tree_for_each_predictor = bool(tree_for_each_predictor)
         self.tree_use_default_params = bool(tree_use_default_params)
         self.tree_select_best_model = bool(tree_select_best_model)
+        self.tree_use_external_eval_set = bool(tree_use_external_eval_set)
         self.concat_tree_with_orig_features = bool(concat_tree_with_orig_features)
         self.tree_max_leaves = tree_max_leaves
         self.tree_gamma = tree_gamma
@@ -1664,12 +1666,14 @@ class _iLTMBase(BaseEstimator):
             X_val_original, y_val_proc = None, None
             y_val_tensor_base = None
 
+        tree_eval_set = eval_set if self.tree_use_external_eval_set else None
+
         # Single tree path
         if self.tree_embedding and not self.tree_for_each_predictor:
             X_tree, y_tree, X_for_nn, y_for_nn = self._split_data_tree_embedding(
                 X_original, y_proc, random_state=self.seed
             )
-            self.tr_.fit_tree(X_tree, y_tree, eval_set=eval_set, concat_with_orig_features=self.concat_tree_with_orig_features)  # type: ignore[union-attr]
+            self.tr_.fit_tree(X_tree, y_tree, eval_set=tree_eval_set, concat_with_orig_features=self.concat_tree_with_orig_features)  # type: ignore[union-attr]
 
             X_emb_train = self.tr_.transform(X_for_nn)  # type: ignore[union-attr]
             X_emb_val = None
@@ -1779,7 +1783,7 @@ class _iLTMBase(BaseEstimator):
                 X_tree, y_tree, X_for_nn, y_for_nn = self._split_data_tree_embedding(
                     X_original, y_proc, random_state=self.seed + i
                 )
-                self.tr_[i].fit_tree(X_tree, y_tree, eval_set=eval_set, concat_with_orig_features=self.concat_tree_with_orig_features)
+                self.tr_[i].fit_tree(X_tree, y_tree, eval_set=tree_eval_set, concat_with_orig_features=self.concat_tree_with_orig_features)
 
                 X_emb_tr = self.tr_[i].transform(X_for_nn)
                 X_emb_val = self.tr_[i].transform(X_val_original) if X_val_original is not None else None
@@ -2059,6 +2063,7 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         tree_for_each_predictor: bool = True,
         tree_use_default_params: bool = False,
         tree_select_best_model: bool = True,
+        tree_use_external_eval_set: bool = False,
         concat_tree_with_orig_features: bool = False,
         tree_max_leaves: int | None = None,
         tree_gamma: float | None = 1.4598703125721042,
@@ -2367,6 +2372,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         tree_for_each_predictor: bool = True,
         tree_use_default_params: bool = False,
         tree_select_best_model: bool = True,
+        tree_use_external_eval_set: bool = False,
         concat_tree_with_orig_features: bool = False,
         tree_max_leaves: int | None = None,
         tree_gamma: float | None = 1.4598703125721042,
