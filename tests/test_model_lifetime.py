@@ -88,6 +88,7 @@ def test_fit_releases_training_model_and_preserves_predictions(monkeypatch):
         n_dims=2,
         preprocessing="none",
         corr_select_k=0,
+        tree_embedding=False,
         finetuning=False,
         adaptive_memory=False,
     )
@@ -157,6 +158,7 @@ def test_failed_fit_releases_cached_training_model(
         n_dims=2,
         preprocessing="none",
         corr_select_k=0,
+        tree_embedding=False,
         finetuning=False,
         adaptive_memory=False,
     )
@@ -254,6 +256,7 @@ def test_serialization_excludes_training_model_and_preserves_predictions():
         preprocessing="none",
         n_dims=2,
         corr_select_k=0,
+        tree_embedding=False,
     )
     classifier.classes_ = np.array([0, 1])
     classifier.n_classes_ = 2
