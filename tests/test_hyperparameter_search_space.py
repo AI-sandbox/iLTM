@@ -116,44 +116,15 @@ class TestSearchSpaceDefinition:
         assert space["finetuning_subset_max_samples"]["value"] == 100_000
         assert space["val_max_samples"]["value"] == 25_000
 
-    def test_tree_ranges_include_current_default_regions(self):
+    def test_tree_ranges_exclude_underfitting_extremes(self):
         space = get_hyperparameter_search_space()
 
-        assert space["tree_min_samples_leaf"]["choices"] == [
-            1,
-            2,
-            4,
-            8,
-            12,
-            16,
-            90,
-        ]
-        assert space["tree_min_samples_leaf"]["probs"] == [
-            0.15,
-            0.15,
-            0.15,
-            0.15,
-            0.15,
-            0.15,
-            0.10,
-        ]
+        assert space["tree_lr"]["low"] == 1e-2
+        assert space["tree_min_samples_leaf"]["choices"] == [1, 2, 4, 8, 12, 16]
+        assert "probs" not in space["tree_min_samples_leaf"]
         assert space["tree_max_depth"]["probs"] == [0.20, 0.65, 0.15]
-        assert space["tree_gamma"]["choices"] == [
-            0.0,
-            0.05,
-            0.1,
-            0.25,
-            0.5,
-            1.5,
-        ]
-        assert space["tree_gamma"]["probs"] == [
-            0.54,
-            0.09,
-            0.09,
-            0.09,
-            0.09,
-            0.10,
-        ]
+        assert space["tree_gamma"]["choices"] == [0.0, 0.05, 0.1, 0.25, 0.5]
+        assert space["tree_gamma"]["probs"] == [0.6, 0.1, 0.1, 0.1, 0.1]
 
     def test_corr_select_k_excludes_aggressive_small_positive_cutoffs(self):
         spec = get_hyperparameter_search_space()["corr_select_k"]
@@ -417,15 +388,15 @@ class TestSampledConfigParameterRanges:
                 assert config["tree_data_split"] in ["dynamic", "all"]
                 assert config["tree_for_each_predictor"] is True
                 assert config["tree_n_estimators"] in [100, 125, 150, 200, 300]
-                assert 1e-3 <= config["tree_lr"] <= 1.0
+                assert 1e-2 <= config["tree_lr"] <= 1.0
                 assert config["tree_max_depth"] in [4, 5, 6]
-                assert config["tree_min_samples_leaf"] in [1, 2, 4, 8, 12, 16, 90]
+                assert config["tree_min_samples_leaf"] in [1, 2, 4, 8, 12, 16]
                 assert config["tree_l2_leaf_reg"] in [0.1, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 5]
 
             if checkpoint in XGBOOST_CHECKPOINTS:
                 assert 0.5 <= config["tree_subsample"] <= 1.0
                 assert 0.6 <= config["tree_feature_fraction"] <= 1.0
-                assert config["tree_gamma"] in [0.0, 0.05, 0.1, 0.25, 0.5, 1.5]
+                assert config["tree_gamma"] in [0.0, 0.05, 0.1, 0.25, 0.5]
                 assert CATBOOST_PARAMETERS.isdisjoint(config)
 
             if checkpoint in CATBOOST_CHECKPOINTS:

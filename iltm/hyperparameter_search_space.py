@@ -284,7 +284,7 @@ def get_hyperparameter_search_space(
         },
         "tree_lr": {
             "type": "log_uniform",
-            "low": 1e-3,
+            "low": 1e-2,
             "high": 1.0,
             "checkpoints": tree_checkpoints,
         },
@@ -296,8 +296,7 @@ def get_hyperparameter_search_space(
         },
         "tree_min_samples_leaf": {
             "type": "categorical",
-            "choices": [1, 2, 4, 8, 12, 16, 90],
-            "probs": [0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.10],
+            "choices": [1, 2, 4, 8, 12, 16],
             "checkpoints": tree_checkpoints,
         },
         "tree_l2_leaf_reg": {
@@ -319,8 +318,8 @@ def get_hyperparameter_search_space(
         },
         "tree_gamma": {
             "type": "categorical",
-            "choices": [0.0, 0.05, 0.1, 0.25, 0.5, 1.5],
-            "probs": [0.54, 0.09, 0.09, 0.09, 0.09, 0.10],
+            "choices": [0.0, 0.05, 0.1, 0.25, 0.5],
+            "probs": [0.6, 0.1, 0.1, 0.1, 0.1],
             "checkpoints": xgboost_checkpoints,
         },
         "tree_bagging_temperature": {
