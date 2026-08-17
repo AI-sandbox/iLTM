@@ -18,6 +18,16 @@ class TestSklearnAPI:
         assert estimator.finetuning_subset_max_samples == 100_000
         assert estimator.val_max_samples == 25_000
 
+    @pytest.mark.parametrize("estimator_class", [iLTMClassifier, iLTMRegressor])
+    def test_scheduler_min_lr_cannot_exceed_finetuning_lr(self, estimator_class):
+        with pytest.raises(ValueError, match="scheduler_min_lr"):
+            estimator_class(
+                checkpoint=None,
+                device="cpu",
+                finetuning_lr=1e-4,
+                scheduler_min_lr=1.1e-4,
+            )
+
     @pytest.mark.parametrize(
         ("estimator_class", "estimator_type"),
         [

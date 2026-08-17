@@ -290,6 +290,8 @@ class _iLTMBase(BaseEstimator):
         self.finetuning_dropout = float(finetuning_dropout)
         self.finetuning_max_steps = int(finetuning_max_steps)
         self.finetuning_lr = float(finetuning_lr)
+        if scheduler_min_lr > self.finetuning_lr:
+            raise ValueError("scheduler_min_lr must be less than or equal to finetuning_lr.")
         self.finetuning_classification_val_metric = finetuning_classification_val_metric
         self.initial_transformations_finetuning = bool(initial_transformations_finetuning)
         self.early_stopping_mode = early_stopping_mode

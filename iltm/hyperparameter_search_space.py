@@ -357,7 +357,7 @@ def get_hyperparameter_search_space(
         "clip_data_value": {"type": "constant", "value": 1_000_000},
         "rf_size": {"type": "constant", "value": 32_768},
         "pca_sampling": {"type": "constant", "value": "zeropad"},
-        "scheduler_min_lr": {"type": "log_uniform", "low": 1e-7, "high": 3e-4},
+        "scheduler_min_lr": {"type": "log_uniform", "low": 1e-7, "high": 1e-4},
         "clip_predictions": {
             "type": "categorical",
             "choices": [False, True],

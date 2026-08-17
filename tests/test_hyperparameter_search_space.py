@@ -435,7 +435,7 @@ class TestSampledConfigParameterRanges:
             # Other parameters
             assert config["device"] == "cuda:0"
             assert config["pca_sampling"] == "zeropad"
-            assert 1e-7 <= config["scheduler_min_lr"] <= 3e-4
+            assert 1e-7 <= config["scheduler_min_lr"] <= config["finetuning_lr"]
             assert isinstance(config["clip_predictions"], bool)
             assert config["corr_select_k"] in [
                 0,
