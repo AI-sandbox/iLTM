@@ -65,3 +65,24 @@ class TestCheckpointResolution:
         assert config['tree_model'] == 'XGBoost_hist'
         assert config['concat_tree_with_orig_features'] is True
 
+    def test_only_concat_checkpoints_include_original_features(self, monkeypatch):
+        monkeypatch.setattr(
+            "iltm.model_checkpoints._ensure_checkpoint",
+            lambda _repo_id, filename, _ckpt_dir: filename,
+        )
+
+        checkpoint_names = (
+            "r128bn",
+            "rnobn",
+            "catb",
+            "xgb",
+            "rtr",
+            "rtrcb",
+            "cbrconcat",
+            "xgbrconcat",
+        )
+        for checkpoint_name in checkpoint_names:
+            config = get_model_checkpoint_config(checkpoint_name)
+            assert config["concat_tree_with_orig_features"] is (
+                "concat" in checkpoint_name
+            )

@@ -80,31 +80,37 @@ def get_model_checkpoint_config(model_name_suffix: str) -> Dict[str, Any]:
             "preprocessing": "realmlp_td_s_v0",
             "bottleneck_size": 128,
             "tree_embedding": False,
+            "concat_tree_with_orig_features": False,
         },
         "rnobn": {
             "preprocessing": "realmlp_td_s_v0",
             "tree_embedding": False,
+            "concat_tree_with_orig_features": False,
         },
         "catb": {
             "preprocessing": "none",
             "tree_embedding": True,
             "tree_model": "CatBoost",
+            "concat_tree_with_orig_features": False,
         },
         "xgb": {
             "preprocessing": "none",
             "tree_embedding": True,
             "tree_model": "XGBoost_hist",
+            "concat_tree_with_orig_features": False,
         },
         "rtr": {
             "preprocessing": "realmlp_td_s_v0",
             "do_retrieval": True,
             "tree_embedding": False,
+            "concat_tree_with_orig_features": False,
         },
         "rtrcb": {
             "preprocessing": "none",
             "tree_embedding": True,
             "tree_model": "CatBoost",
             "do_retrieval": True,
+            "concat_tree_with_orig_features": False,
         },
         "cbrconcat": {
             "preprocessing": "realmlp_td_s_v0",
@@ -149,4 +155,3 @@ def resolve_model_checkpoint(checkpoint: str) -> Dict[str, Any]:
             return {"checkpoint": str(pth_files[0])}
 
     return get_model_checkpoint_config(checkpoint)
-
