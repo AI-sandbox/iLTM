@@ -142,7 +142,10 @@ def sample_data(X: Tensor | dict, y: Tensor,
                 batch_size: int = 2048,
                 min_samples: int = 784,
                 pca_sampling: str = 'repeat',
-                return_rest: bool = False) -> Tuple[Tensor, Tensor]:
+                return_rest: bool = False,
+                return_sampled_indices: bool = False) -> Tuple[Tensor, Tensor]:
+    if return_sampled_indices and to_meta_model:
+        raise ValueError("to_meta_model must be False when returning sampled indices.")
     # For regression, stratification is not applicable; always use random sampling:
     sampled_indices = torch.randperm(len(y))[:batch_size]
 
@@ -156,6 +159,7 @@ def sample_data(X: Tensor | dict, y: Tensor,
     y_sampled = y[sampled_indices]
 
     if return_rest:
+        assert not return_sampled_indices
         assert not to_meta_model, "to_meta_model must be False when return_rest is True."
         not_sampled_mask = torch.ones(len(y), dtype=torch.bool)
         not_sampled_mask[sampled_indices] = False
@@ -198,6 +202,8 @@ def sample_data(X: Tensor | dict, y: Tensor,
         else:
             raise ValueError("Invalid PCA sampling method.")
 
+    if return_sampled_indices:
+        return X_sampled, y_sampled, sampled_indices
     return X_sampled, y_sampled
 
 
@@ -337,10 +343,31 @@ def prepare_retrieval_context(
 def retrieval(X_ctxt_superset, y_ctxt_superset, intermediate_state, n_classes, batch_size, distance_type, temperature,
               model_cfg, rf, pca, norm, main_network, device, use_amp=False,
               training_finetuning: bool = False, finetuning_dropout: float = 0.0,
-              prepared_context: tuple[Tensor, Tensor] | None = None) -> Tensor:
+              prepared_context: tuple[Tensor, Tensor] | None = None,
+              query_ids: Tensor | None = None,
+              context_ids_superset: Tensor | None = None,
+              return_valid_mask: bool = False) -> Tensor | tuple[Tensor, Tensor]:
     # Based on ModernNCA code: https://github.com/qile2000/LAMDA-TALENT/blob/main/LAMDA_TALENT/model/methods/modernNCA.py
+    if (query_ids is None) != (context_ids_superset is None):
+        raise ValueError("query_ids and context_ids_superset must be provided together.")
+    if query_ids is not None and prepared_context is not None:
+        raise ValueError("Row-ID masking is not supported with a prepared context.")
+
     if prepared_context is None:
-        X_ctxt, y_ctxt = sample_data(X_ctxt_superset, y_ctxt_superset, to_meta_model=False, batch_size=batch_size)  # stochastic neighbor sampling
+        if query_ids is None:
+            X_ctxt, y_ctxt = sample_data(X_ctxt_superset, y_ctxt_superset, to_meta_model=False, batch_size=batch_size)
+            context_ids = None
+        else:
+            X_ctxt, y_ctxt, sampled_indices = sample_data(
+                X_ctxt_superset,
+                y_ctxt_superset,
+                to_meta_model=False,
+                batch_size=batch_size,
+                return_sampled_indices=True,
+            )
+            context_ids = context_ids_superset[
+                sampled_indices.to(context_ids_superset.device)
+            ].to(device)
         if isinstance(X_ctxt, dict):
             X_ctxt = {
                 'x_num': X_ctxt['x_num'].to(device),
@@ -357,6 +384,7 @@ def retrieval(X_ctxt_superset, y_ctxt_superset, intermediate_state, n_classes, b
                                                             training_finetuning=training_finetuning, finetuning_dropout=finetuning_dropout)
     else:
         X_ctxt, y_ctxt = prepared_context
+        context_ids = None
 
     if distance_type == 'euclidean':
         distances = torch.cdist(intermediate_state, X_ctxt, p=2)
@@ -368,11 +396,20 @@ def retrieval(X_ctxt_superset, y_ctxt_superset, intermediate_state, n_classes, b
     else:
         raise ValueError(f"Invalid distance type: {distance_type}")
 
+    valid_retrieval = torch.ones(len(intermediate_state), dtype=torch.bool, device=device)
+    if query_ids is not None:
+        self_mask = query_ids.to(device)[:, None].eq(context_ids[None, :])
+        valid_retrieval = ~self_mask.all(dim=1)
+        self_mask &= valid_retrieval[:, None]
+        distances = distances.masked_fill(self_mask, float("inf"))
+
     distances = distances / temperature
     distances = F.softmax(-distances, dim=-1)
     outputs = torch.mm(distances, y_ctxt)
     if n_classes > 1:
         outputs = torch.log(outputs.clamp_min(1e-12))
+    if return_valid_mask:
+        return outputs, valid_retrieval
     return outputs
 
 
@@ -382,7 +419,9 @@ def full_main_forward(X_grad, n_classes, batch_size, model_cfg,
                       retrieval_alpha: float = 0.5, retrieval_temperature: float = 1.0, retrieval_distance: str = 'cosine',
                       training_finetuning: bool = False, finetuning_dropout: float = 0.0,
                       prepared_retrieval_context: tuple[Tensor, Tensor] | None = None,
-                      return_retrieval_components: bool = False) -> Tensor | tuple[Tensor, Tensor]:
+                      return_retrieval_components: bool = False,
+                      query_ids: Tensor | None = None,
+                      context_ids_superset: Tensor | None = None) -> Tensor | tuple[Tensor, Tensor]:
 
     if do_retrieval:
         use_amp = False
@@ -393,19 +432,30 @@ def full_main_forward(X_grad, n_classes, batch_size, model_cfg,
     )
 
     if do_retrieval:
-        retrieval_outputs = retrieval(
+        retrieval_result = retrieval(
             X_ctxt_superset, y_ctxt_superset, intermediate_state, n_classes,
             batch_size, retrieval_distance, retrieval_temperature,
             model_cfg, rf, pca, norm, main_network, device, use_amp=use_amp,
             training_finetuning=training_finetuning, finetuning_dropout=finetuning_dropout,
             prepared_context=prepared_retrieval_context,
+            query_ids=query_ids,
+            context_ids_superset=context_ids_superset,
+            return_valid_mask=query_ids is not None,
         )
+        if query_ids is None:
+            retrieval_outputs = retrieval_result
+            valid_retrieval = None
+        else:
+            retrieval_outputs, valid_retrieval = retrieval_result
+        main_outputs = outputs
         if return_retrieval_components:
             if n_classes == 1:
                 outputs = outputs.squeeze(1)
                 retrieval_outputs = retrieval_outputs.squeeze(1)
             return outputs, retrieval_outputs
         outputs = (1 - retrieval_alpha) * outputs + retrieval_alpha * retrieval_outputs
+        if valid_retrieval is not None:
+            outputs = torch.where(valid_retrieval[:, None], outputs, main_outputs)
     elif return_retrieval_components:
         raise ValueError("Retrieval components require do_retrieval=True.")
 
@@ -553,12 +603,15 @@ class MainNetworkTrainable(nn.Module):
     def retrieval_temperature(self):
         return self._log_T.exp().clamp_min(1e-4)
 
-    def forward(self, X: Tensor, X_ctxt_superset: Tensor | None = None, y_ctxt_superset: Tensor | None = None, training: bool = False):
+    def forward(self, X: Tensor, X_ctxt_superset: Tensor | None = None, y_ctxt_superset: Tensor | None = None,
+                training: bool = False, query_ids: Tensor | None = None,
+                context_ids_superset: Tensor | None = None):
         return full_main_forward(X, self.n_classes, self.batch_size, self.cfg,
                                  self.rf, self.pca, self.norm, self.main_network, self.device, self.use_amp_finetuning,
                                  self.do_retrieval, X_ctxt_superset, y_ctxt_superset,
                                  self.retrieval_alpha, self.retrieval_temperature, self.retrieval_distance_type,
-                                 training_finetuning=training, finetuning_dropout=self.finetuning_dropout)
+                                 training_finetuning=training, finetuning_dropout=self.finetuning_dropout,
+                                 query_ids=query_ids, context_ids_superset=context_ids_superset)
 
     def get_main_network_parts(self):
 
@@ -751,26 +804,36 @@ def fine_tune_main_network(
             X_cat_val = X_val['x_cat']
             X_val = torch.cat([X_num_val, X_cat_val], dim=1)
 
+    row_ids = np.arange(len(y))
     if X_val is None and y_val is None:
         # Split data into training and validation sets (different for each predictor) for early stopping
         if finetuning_val_frac > 0.0:
             # check if stratification is possible
             y_np = y.cpu().numpy()
             stratify_by = check_stratification(y_np, stratify=True, task_type='classification') if n_classes > 1 else None
-            X_train, X_val, y_train, y_val = train_test_split(X.cpu().numpy(), y_np, test_size=finetuning_val_frac, random_state=None, stratify=stratify_by)
+            X_train, X_val, y_train, y_val, train_ids, _ = train_test_split(
+                X.cpu().numpy(), y_np, row_ids, test_size=finetuning_val_frac,
+                random_state=None, stratify=stratify_by,
+            )
         else:
             X_train, y_train = X.cpu().numpy(), y.cpu().numpy()
+            train_ids = row_ids
     else:
         X_train, y_train = X.cpu().numpy(), y.cpu().numpy()
         X_val, y_val = X_val.cpu().numpy(), y_val.cpu().numpy()
+        train_ids = row_ids
 
     # If finetuning_data is 'entire_dataset', use all training data for fine-tuning.
     # If 'bootstrap', use a subset of same size as the original dataset, but sampling with replacement.
     if finetuning_data == 'bootstrap':
-        X_train, y_train = resample(X_train, y_train, replace=True, n_samples=len(X_train), random_state=None)
+        X_train, y_train, train_ids = resample(
+            X_train, y_train, train_ids, replace=True,
+            n_samples=len(X_train), random_state=None,
+        )
         logger.debug("Using bootstrap sampling for fine-tuning.")
 
     X_train, y_train = torch.from_numpy(X_train), torch.from_numpy(y_train)
+    train_ids = torch.from_numpy(train_ids)
     if X_val is not None and y_val is not None:
         X_val, y_val = torch.from_numpy(X_val), torch.from_numpy(y_val)
 
@@ -798,7 +861,7 @@ def fine_tune_main_network(
     def build_epoch_loaders(X_train_full, y_train_full):
         idx = make_train_indices_epoch(len(X_train_full))
         train_dataset = Subset(
-            TensorDataset(X_train_full, y_train_full),
+            TensorDataset(X_train_full, y_train_full, train_ids),
             idx,
         )
         # Only use pin_memory for CUDA devices to avoid deprecation warnings on CPU
@@ -890,12 +953,15 @@ def fine_tune_main_network(
             idx_ctxt = torch.randperm(len(X_train))[:max_ctxt]
             X_ctxt_superset = X_train[idx_ctxt].to(device)
             y_ctxt_superset = y_train[idx_ctxt].to(device)
+            context_ids_superset = train_ids[idx_ctxt].to(device)
         else:
             X_ctxt_superset = X_train.to(device)
             y_ctxt_superset = y_train.to(device)
+            context_ids_superset = train_ids.to(device)
     else:
         X_ctxt_superset = None
         y_ctxt_superset = None
+        context_ids_superset = None
 
     # Model setup
     main_model = MainNetworkTrainable(cfg, n_classes, batch_size, rf, pca, main_network, norm, finetuning_dropout=finetuning_dropout, device=device,
@@ -1060,7 +1126,7 @@ def fine_tune_main_network(
                     )
 
         batches_run_this_epoch = 0
-        for it, (inputs, targets) in enumerate(train_loader):
+        for it, (inputs, targets, query_ids) in enumerate(train_loader):
             # before starting a new step, check deadline using the running average
             if fit_deadline is not None and avg_step_time:
                 remaining = fit_deadline - time.time()
@@ -1072,10 +1138,21 @@ def fine_tune_main_network(
 
             step_t0 = time.time()                 # NEW
 
-            inputs, targets = inputs.to(device), targets.to(device)
+            inputs, targets, query_ids = inputs.to(device), targets.to(device), query_ids.to(device)
             optimizer.zero_grad()
             with torch.amp.autocast(device.type, enabled=(use_amp_finetuning and device.type == 'cuda')):
-                outputs = main_model(inputs, X_ctxt_superset, y_ctxt_superset, training=True)
+                forward_kwargs = {"training": True}
+                if do_retrieval:
+                    forward_kwargs.update(
+                        query_ids=query_ids,
+                        context_ids_superset=context_ids_superset,
+                    )
+                outputs = main_model(
+                    inputs,
+                    X_ctxt_superset,
+                    y_ctxt_superset,
+                    **forward_kwargs,
+                )
                 if outputs.shape != targets.shape and n_classes == 1:
                     raise ValueError(f"Shape mismatch between outputs and targets: outputs {outputs.shape}, targets {targets.shape}")
                 loss = criterion(outputs, targets)
