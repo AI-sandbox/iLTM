@@ -3,6 +3,7 @@ import gc
 import warnings
 import numpy as np
 import pandas as pd
+from sklearn.feature_selection import f_classif, f_regression
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OrdinalEncoder, OneHotEncoder
 from sklearn.ensemble import GradientBoostingRegressor, RandomTreesEmbedding, GradientBoostingClassifier
@@ -91,6 +92,7 @@ class TreeEmbedding:
         self.bagging_temperature = bagging_temperature
         self.onehot_max_features = onehot_max_features
         self.n_orig_features_to_keep_ = None
+        self.orig_feature_indices_to_keep_ = None
 
         if use_default_params: # override any other parameters that are set
             self.lr = None
@@ -663,6 +665,70 @@ class TreeEmbedding:
 
         return emb
 
+    @staticmethod
+    def _association_array(X: pd.DataFrame | np.ndarray) -> np.ndarray:
+        X_df = pd.DataFrame(X, copy=False)
+        if all(pd.api.types.is_numeric_dtype(dtype) for dtype in X_df.dtypes):
+            values = X_df.to_numpy(
+                dtype=np.float64,
+                na_value=np.nan,
+                copy=True,
+            )
+            finite = np.isfinite(values)
+            counts = finite.sum(axis=0)
+            fills = np.divide(
+                np.where(finite, values, 0.0).sum(axis=0),
+                counts,
+                out=np.zeros(values.shape[1], dtype=np.float64),
+                where=counts > 0,
+            )
+            return np.where(finite, values, fills)
+        values = np.empty(X_df.shape, dtype=np.float64)
+        for idx in range(X_df.shape[1]):
+            series = X_df.iloc[:, idx]
+            if pd.api.types.is_numeric_dtype(series.dtype):
+                column_values = pd.to_numeric(series, errors="coerce").to_numpy(
+                    dtype=np.float64,
+                    copy=False,
+                )
+            else:
+                column_values = pd.factorize(
+                    series.astype("string"),
+                    sort=True,
+                )[0].astype(np.float64)
+                column_values[column_values < 0] = np.nan
+            finite = np.isfinite(column_values)
+            fill = column_values[finite].mean() if finite.any() else 0.0
+            values[:, idx] = np.where(finite, column_values, fill)
+        return values
+
+    def _select_original_feature_indices(
+        self,
+        X: pd.DataFrame | np.ndarray,
+        y: np.ndarray | pd.Series,
+        n_features: int,
+    ) -> np.ndarray:
+        X_df = pd.DataFrame(X, copy=False)
+        scores = np.zeros(X_df.shape[1], dtype=np.float64)
+        scorer = f_regression if self.task_type == "regression" else f_classif
+        for start in range(0, X_df.shape[1], 1024):
+            stop = min(start + 1024, X_df.shape[1])
+            values = self._association_array(X_df.iloc[:, start:stop])
+            active = values.max(axis=0) > values.min(axis=0)
+            if active.any():
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    chunk_scores = scorer(values[:, active], y)[0]
+                chunk_result = scores[start:stop]
+                chunk_result[active] = np.nan_to_num(
+                    chunk_scores,
+                    nan=0.0,
+                    posinf=np.finfo(np.float64).max,
+                    neginf=0.0,
+                )
+        order = np.lexsort((np.arange(scores.size), -scores))
+        return np.sort(order[:n_features])
+
     def fit_tree(self, X: pd.DataFrame | np.ndarray, y: np.ndarray, eval_set: tuple = None, concat_with_orig_features: bool = True) -> None:
         """
         Fits a tree-based model on the input data.
@@ -672,6 +738,9 @@ class TreeEmbedding:
             y (np.ndarray): Target variable for model training.
         """
         logger.info(f"Fitting tree model: {self.tree_model}")
+        self.n_orig_features_to_keep_ = None
+        self.orig_feature_indices_to_keep_ = None
+        self.onehot_top_features_idx_ = None
 
         # Handle categorical features
         X_encoded = self._handle_categorical_features(X, fit=True)
@@ -696,8 +765,12 @@ class TreeEmbedding:
                     n_orig_features = X.shape[1]
 
                     if n_orig_features > orig_feature_budget:
-                        # If more original features than budget, select first `orig_feature_budget`
                         self.n_orig_features_to_keep_ = orig_feature_budget
+                        self.orig_feature_indices_to_keep_ = self._select_original_feature_indices(
+                            X_encoded,
+                            y,
+                            orig_feature_budget,
+                        )
                     else:
                         # Otherwise, keep all original features
                         self.n_orig_features_to_keep_ = n_orig_features

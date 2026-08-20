@@ -877,6 +877,23 @@ class _iLTMBase(BaseEstimator):
         return pd.concat([original, embeddings], axis=1)
 
     @staticmethod
+    def _select_original_features_for_tree(
+        tree: TreeEmbedding,
+        X: np.ndarray | pd.DataFrame,
+    ) -> np.ndarray | pd.DataFrame:
+        indices = getattr(tree, "orig_feature_indices_to_keep_", None)
+        if indices is not None:
+            if isinstance(X, pd.DataFrame):
+                return X.iloc[:, indices]
+            return X[:, indices]
+        n_features = getattr(tree, "n_orig_features_to_keep_", None)
+        if n_features is None:
+            return X
+        if isinstance(X, pd.DataFrame):
+            return X.iloc[:, :n_features]
+        return X[:, :n_features]
+
+    @staticmethod
     def _combine_preprocessed_columns(
         x_num: np.ndarray,
         x_cat: np.ndarray,
@@ -1704,21 +1721,12 @@ class _iLTMBase(BaseEstimator):
                 X_emb_val = self.tr_.transform(X_val_original)  # type: ignore[union-attr]
 
             if self.concat_tree_with_orig_features:
-                if self.tr_.n_orig_features_to_keep_ is not None:  # type: ignore[union-attr]
-                    if isinstance(X_for_nn, pd.DataFrame):
-                        X_for_nn = X_for_nn.iloc[:, :self.tr_.n_orig_features_to_keep_]  # type: ignore[union-attr]
-                    else:
-                        X_for_nn = X_for_nn[:, :self.tr_.n_orig_features_to_keep_]  # type: ignore[union-attr]
+                X_for_nn = self._select_original_features_for_tree(self.tr_, X_for_nn)  # type: ignore[arg-type]
                 X_work = self._concatenate_original_and_tree_features(
                     X_for_nn, X_emb_train
                 )
                 if X_val_original is not None and X_emb_val is not None:
-                    X_val_work = X_val_original
-                    if self.tr_.n_orig_features_to_keep_ is not None:  # type: ignore[union-attr]
-                        if isinstance(X_val_work, pd.DataFrame):
-                            X_val_work = X_val_work.iloc[:, :self.tr_.n_orig_features_to_keep_]  # type: ignore[union-attr]
-                        else:
-                            X_val_work = X_val_work[:, :self.tr_.n_orig_features_to_keep_]  # type: ignore[union-attr]
+                    X_val_work = self._select_original_features_for_tree(self.tr_, X_val_original)  # type: ignore[arg-type]
                     X_val_work = self._concatenate_original_and_tree_features(
                         X_val_work, X_emb_val
                     )
@@ -1812,21 +1820,15 @@ class _iLTMBase(BaseEstimator):
                 X_emb_val = self.tr_[i].transform(X_val_original) if X_val_original is not None else None
 
                 if self.concat_tree_with_orig_features:
-                    if self.tr_[i].n_orig_features_to_keep_ is not None:
-                        if isinstance(X_for_nn, pd.DataFrame):
-                            X_for_nn = X_for_nn.iloc[:, :self.tr_[i].n_orig_features_to_keep_]
-                        else:
-                            X_for_nn = X_for_nn[:, :self.tr_[i].n_orig_features_to_keep_]
+                    X_for_nn = self._select_original_features_for_tree(self.tr_[i], X_for_nn)
                     X_fit = self._concatenate_original_and_tree_features(
                         X_for_nn, X_emb_tr
                     )
                     if X_val_original is not None and X_emb_val is not None:
-                        X_val_work = X_val_original
-                        if self.tr_[i].n_orig_features_to_keep_ is not None:
-                            if isinstance(X_val_work, pd.DataFrame):
-                                X_val_work = X_val_work.iloc[:, :self.tr_[i].n_orig_features_to_keep_]
-                            else:
-                                X_val_work = X_val_work[:, :self.tr_[i].n_orig_features_to_keep_]
+                        X_val_work = self._select_original_features_for_tree(
+                            self.tr_[i],
+                            X_val_original,
+                        )
                         X_val_fit = self._concatenate_original_and_tree_features(
                             X_val_work, X_emb_val
                         )
@@ -1927,11 +1929,7 @@ class _iLTMBase(BaseEstimator):
         if self.tree_embedding and not self.tree_for_each_predictor:
             X_emb = self.tr_.transform(X_original)  # type: ignore[union-attr]
             if self.concat_tree_with_orig_features:
-                if self.tr_.n_orig_features_to_keep_ is not None:  # type: ignore[union-attr]
-                    if isinstance(X_original, pd.DataFrame):
-                        X_original = X_original.iloc[:, :self.tr_.n_orig_features_to_keep_]  # type: ignore[union-attr]
-                    else:
-                        X_original = X_original[:, :self.tr_.n_orig_features_to_keep_]  # type: ignore[union-attr]
+                X_original = self._select_original_features_for_tree(self.tr_, X_original)  # type: ignore[arg-type]
                 X_work = self._concatenate_original_and_tree_features(
                     X_original, X_emb
                 )
@@ -1981,12 +1979,10 @@ class _iLTMBase(BaseEstimator):
                         X_batch_orig = X_original.iloc[start:end] if isinstance(X_original, pd.DataFrame) else X_original[start:end]
                         X_emb = self.tr_[i].transform(X_batch_orig)
                         if self.concat_tree_with_orig_features:
-                            X_batch_base = X_batch_orig
-                            if self.tr_[i].n_orig_features_to_keep_ is not None:
-                                if isinstance(X_batch_base, pd.DataFrame):
-                                    X_batch_base = X_batch_base.iloc[:, :self.tr_[i].n_orig_features_to_keep_]
-                                else:
-                                    X_batch_base = X_batch_base[:, :self.tr_[i].n_orig_features_to_keep_]
+                            X_batch_base = self._select_original_features_for_tree(
+                                self.tr_[i],
+                                X_batch_orig,
+                            )
                             X_batch = self._concatenate_original_and_tree_features(
                                 X_batch_base, X_emb
                             )
@@ -2747,12 +2743,10 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
                             X_batch_orig = X.iloc[start:end] if isinstance(X, pd.DataFrame) else X[start:end]
                             X_emb = self.tr_[i].transform(X_batch_orig)
                             if self.concat_tree_with_orig_features:
-                                X_base = X_batch_orig
-                                if self.tr_[i].n_orig_features_to_keep_ is not None:
-                                    if isinstance(X_base, pd.DataFrame):
-                                        X_base = X_base.iloc[:, :self.tr_[i].n_orig_features_to_keep_]
-                                    else:
-                                        X_base = X_base[:, :self.tr_[i].n_orig_features_to_keep_]
+                                X_base = self._select_original_features_for_tree(
+                                    self.tr_[i],
+                                    X_batch_orig,
+                                )
                                 X_batch = self._concatenate_original_and_tree_features(
                                     X_base, X_emb
                                 )
