@@ -1064,8 +1064,9 @@ class _iLTMBase(BaseEstimator):
         else:
             n_preprocessed_features = x.shape[1]
 
-        if self.corr_select_k > 0 and n_preprocessed_features > self.corr_select_k:
-            logger.debug(f"Applying correlation-based feature selection: selecting up to {self.corr_select_k} features using posneg_topk strategy (only non-zero correlations)")
+        corr_select_k = min(self.corr_select_k, 20_000) if self.corr_select_k > 0 else 20_000
+        if corr_select_k > 0 and n_preprocessed_features > corr_select_k:
+            logger.debug(f"Applying correlation-based feature selection: selecting up to {corr_select_k} features using posneg_topk strategy (only non-zero correlations)")
             if self.preprocessing == 'realmlp_td_s_v0':
                 correlations = []
                 for columns in (x_num, x_cat):
@@ -1076,7 +1077,7 @@ class _iLTMBase(BaseEstimator):
                 r = np.concatenate(correlations)
             else:
                 r = compute_feature_target_correlations(x, y)
-            selected_indices = select_top_correlated_features(r, self.corr_select_k)
+            selected_indices = select_top_correlated_features(r, corr_select_k)
             if self.preprocessing == 'realmlp_td_s_v0':
                 x = self._combine_preprocessed_columns(
                     x_num, x_cat, selected_indices
@@ -1537,10 +1538,9 @@ class _iLTMBase(BaseEstimator):
                 logger.warning("CUDA OOM during inference forward. Reducing batch size %d -> %d", bs, new_bs)
                 bs = new_bs
 
-        outputs = torch.cat(outs, dim=0)
         if return_retrieval_components:
-            return outputs, torch.cat(retrieval_outs, dim=0)
-        return outputs
+            return torch.cat(outs, dim=0), torch.cat(retrieval_outs, dim=0)
+        return torch.cat(outs, dim=0)
 
 
     # -----------------------------
@@ -2095,7 +2095,12 @@ class _iLTMBase(BaseEstimator):
                 def score(alpha: float) -> float:
                     logits = (1.0 - alpha) * main_outputs + alpha * retrieval_outputs
                     probabilities = torch.softmax(logits, dim=-1).mean(dim=0)
-                    return float(robust_roc_auc_score(y_array, probabilities.numpy()))
+                    return float(
+                        robust_roc_auc_score(
+                            y_array,
+                            probabilities.numpy(),
+                        )
+                    )
 
             else:
                 metric_name = "LogLoss"
@@ -2112,7 +2117,10 @@ class _iLTMBase(BaseEstimator):
                         ).mean()
                     )
 
-        scored = [(alpha, score(alpha)) for alpha in sorted(candidates)]
+        scored = [
+            (alpha, score(alpha))
+            for alpha in sorted(candidates)
+        ]
         scored = [(alpha, value) for alpha, value in scored if np.isfinite(value)]
         if not scored:
             logger.warning("Adaptive retrieval alpha found no finite validation score.")
@@ -2344,7 +2352,7 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
             if self.retrieval_alpha_adaptive:
                 if eval_set_proc is None:
                     logger.warning(
-                        "Adaptive retrieval alpha requires eval_set; using initial alpha %.6f.",
+                        "Adaptive retrieval alpha requires eval_set; using retrieval_alpha=%.6f.",
                         self.retrieval_alpha,
                     )
                 else:
@@ -2687,7 +2695,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
             if self.retrieval_alpha_adaptive:
                 if eval_set is None:
                     logger.warning(
-                        "Adaptive retrieval alpha requires eval_set; using initial alpha %.6f.",
+                        "Adaptive retrieval alpha requires eval_set; using retrieval_alpha=%.6f.",
                         self.retrieval_alpha,
                     )
                 else:
