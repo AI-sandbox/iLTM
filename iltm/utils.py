@@ -381,7 +381,8 @@ def full_main_forward(X_grad, n_classes, batch_size, model_cfg,
                       do_retrieval: bool = False, X_ctxt_superset: Tensor | None = None, y_ctxt_superset: Tensor | None = None,
                       retrieval_alpha: float = 0.5, retrieval_temperature: float = 1.0, retrieval_distance: str = 'cosine',
                       training_finetuning: bool = False, finetuning_dropout: float = 0.0,
-                      prepared_retrieval_context: tuple[Tensor, Tensor] | None = None) -> Tensor:
+                      prepared_retrieval_context: tuple[Tensor, Tensor] | None = None,
+                      return_retrieval_components: bool = False) -> Tensor | tuple[Tensor, Tensor]:
 
     if do_retrieval:
         use_amp = False
@@ -399,7 +400,14 @@ def full_main_forward(X_grad, n_classes, batch_size, model_cfg,
             training_finetuning=training_finetuning, finetuning_dropout=finetuning_dropout,
             prepared_context=prepared_retrieval_context,
         )
+        if return_retrieval_components:
+            if n_classes == 1:
+                outputs = outputs.squeeze(1)
+                retrieval_outputs = retrieval_outputs.squeeze(1)
+            return outputs, retrieval_outputs
         outputs = (1 - retrieval_alpha) * outputs + retrieval_alpha * retrieval_outputs
+    elif return_retrieval_components:
+        raise ValueError("Retrieval components require do_retrieval=True.")
 
     if n_classes == 1:
         outputs = outputs.squeeze(1)

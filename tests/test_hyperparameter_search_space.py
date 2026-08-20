@@ -327,6 +327,12 @@ class TestConditionalBranches:
             "parameter": "do_retrieval",
             "value": True,
         }
+        assert space["retrieval_alpha"] == {
+            "type": "constant",
+            "value": 0.75,
+            "condition": {"parameter": "do_retrieval", "value": True},
+        }
+        assert space["retrieval_alpha_adaptive"] == {"type": "constant", "value": True}
         assert set(space["do_retrieval"]["forced_true_checkpoints"]) == {
             "rtr",
             "rtrcb",
@@ -373,9 +379,10 @@ class TestSampledConfigParameterRanges:
 
             assert isinstance(config["do_retrieval"], bool)
             assert config["retrieval_alpha_finetuning"] is False
+            assert config["retrieval_alpha_adaptive"] is True
             assert config["retrieval_temperature_finetuning"] is False
             if config["do_retrieval"]:
-                assert 0.0 <= config["retrieval_alpha"] <= 1.0
+                assert config["retrieval_alpha"] == 0.75
                 assert 1.0 <= config["retrieval_temperature"] <= 2.5
                 assert config["retrieval_distance"] in ["cosine", "euclidean"]
             else:

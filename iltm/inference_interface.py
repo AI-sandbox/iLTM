@@ -40,6 +40,7 @@ from iltm.utils import (
     compute_feature_target_correlations,
     select_top_correlated_features,
     detect_object_string_columns,
+    robust_roc_auc_score,
 )
 from .model_checkpoints import resolve_model_checkpoint
 
@@ -212,11 +213,12 @@ class _iLTMBase(BaseEstimator):
         tree_bagging_temperature: float | None = None,
         onehot_max_features: bool = True,
         do_retrieval: bool = True,
-        retrieval_alpha: float = 0.5,
+        retrieval_alpha: float = 0.75,
         retrieval_temperature: float = 1.5,
         retrieval_distance: str = 'cosine',
         retrieval_alpha_finetuning: bool = False,
         retrieval_temperature_finetuning: bool = False,
+        retrieval_alpha_adaptive: bool = True,
         logging_level: int | str = logging.WARNING,
         clip_predictions: bool = True,
         normalize_predictions: bool = False,
@@ -369,6 +371,11 @@ class _iLTMBase(BaseEstimator):
         self.retrieval_distance = retrieval_distance
         self.retrieval_alpha_finetuning = bool(retrieval_alpha_finetuning)
         self.retrieval_temperature_finetuning = bool(retrieval_temperature_finetuning)
+        self.retrieval_alpha_adaptive = bool(retrieval_alpha_adaptive)
+        if self.retrieval_alpha_adaptive and self.retrieval_alpha_finetuning:
+            raise ValueError(
+                "retrieval_alpha_adaptive and retrieval_alpha_finetuning cannot both be enabled."
+            )
 
         # These flags will be respected only for regression
         self.clip_predictions = bool(clip_predictions) if self.task_type == 'regression' else False
@@ -651,6 +658,7 @@ class _iLTMBase(BaseEstimator):
         self.tr_ = None
         self.__dict__.pop("_prediction_calibration_slope_", None)
         self.__dict__.pop("_prediction_calibration_intercept_", None)
+        self.__dict__.pop("retrieval_alpha_", None)
 
     def get_params(self, deep=True):
         params = super().get_params(deep=deep)
@@ -1404,7 +1412,8 @@ class _iLTMBase(BaseEstimator):
         n_outputs: int,
         *,
         manage_predictor_device: bool = True,
-    ) -> Tensor:
+        return_retrieval_components: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         if manage_predictor_device:
             try:
                 predictor = self._move_predictor_to_device(
@@ -1416,6 +1425,7 @@ class _iLTMBase(BaseEstimator):
                     X,
                     n_outputs,
                     manage_predictor_device=False,
+                    return_retrieval_components=return_retrieval_components,
                 )
             finally:
                 self._move_predictor_to_cpu(predictor)
@@ -1473,6 +1483,7 @@ class _iLTMBase(BaseEstimator):
         ds = torch.utils.data.TensorDataset(X_concat)
         bs = int(self.batch_size)
         outs = []
+        retrieval_outs = []
 
         while True:
             try:
@@ -1489,20 +1500,30 @@ class _iLTMBase(BaseEstimator):
                         do_retrieval, X_ctxt_superset_concat, y_ctxt_superset,
                         retrieval_alpha, retrieval_temperature, retrieval_distance,
                         prepared_retrieval_context=prepared_retrieval_context,
+                        return_retrieval_components=return_retrieval_components,
                     )
-                    outs.append(out)
+                    if return_retrieval_components:
+                        main_out, retrieval_out = out
+                        outs.append(main_out)
+                        retrieval_outs.append(retrieval_out)
+                    else:
+                        outs.append(out)
                 break  # success
             except RuntimeError as e:
                 if not is_cuda_oom(e) or bs <= 128:
                     raise
                 outs.clear()
+                retrieval_outs.clear()
                 out = None
                 clear_cuda_cache()
                 new_bs = max(128, bs // 2)
                 logger.warning("CUDA OOM during inference forward. Reducing batch size %d -> %d", bs, new_bs)
                 bs = new_bs
 
-        return torch.cat(outs, dim=0)
+        outputs = torch.cat(outs, dim=0)
+        if return_retrieval_components:
+            return outputs, torch.cat(retrieval_outs, dim=0)
+        return outputs
 
 
     # -----------------------------
@@ -1926,8 +1947,9 @@ class _iLTMBase(BaseEstimator):
         X_original: np.ndarray | pd.DataFrame,
         *,
         n_outputs: int,
-        softmax_per_predictor: bool = False
-    ) -> torch.Tensor:
+        softmax_per_predictor: bool = False,
+        return_retrieval_components: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         check_is_fitted(self)
 
         # If we can preprocess once, do it
@@ -1936,6 +1958,7 @@ class _iLTMBase(BaseEstimator):
             preprocessed_once = self._preprocess_for_predict_once(X_original)
 
         yhats: List[Tensor] = []
+        retrieval_yhats: List[Tensor] = []
 
         for i, predictor in enumerate(self.predictors_):
             if self.tree_embedding and self.tree_for_each_predictor:
@@ -1947,6 +1970,7 @@ class _iLTMBase(BaseEstimator):
                     chunk_rows = 10000
 
                 outs_chunks: List[Tensor] = []
+                retrieval_outs_chunks: List[Tensor] = []
                 try:
                     predictor = self._move_predictor_to_device(
                         predictor,
@@ -1975,23 +1999,148 @@ class _iLTMBase(BaseEstimator):
                             X_tensor,
                             n_outputs=n_outputs,
                             manage_predictor_device=False,
+                            return_retrieval_components=return_retrieval_components,
                         )
-                        if softmax_per_predictor:
-                            out = F.softmax(out, dim=1)
-                        outs_chunks.append(out)
+                        if return_retrieval_components:
+                            main_out, retrieval_out = out
+                            outs_chunks.append(main_out)
+                            retrieval_outs_chunks.append(retrieval_out)
+                        else:
+                            if softmax_per_predictor:
+                                out = F.softmax(out, dim=1)
+                            outs_chunks.append(out)
                 finally:
                     self._move_predictor_to_cpu(predictor)
 
                 outputs = torch.cat(outs_chunks, dim=0)
+                if return_retrieval_components:
+                    retrieval_outputs = torch.cat(retrieval_outs_chunks, dim=0)
             else:
-                outputs = self._forward_pass_predictor(predictor, preprocessed_once, n_outputs=n_outputs)  # type: ignore[arg-type]
-                if softmax_per_predictor:
+                outputs = self._forward_pass_predictor(
+                    predictor,
+                    preprocessed_once,
+                    n_outputs=n_outputs,
+                    return_retrieval_components=return_retrieval_components,
+                )  # type: ignore[arg-type]
+                if return_retrieval_components:
+                    outputs, retrieval_outputs = outputs
+                elif softmax_per_predictor:
                     outputs = F.softmax(outputs, dim=1)
 
             yhats.append(outputs)
+            if return_retrieval_components:
+                retrieval_yhats.append(retrieval_outputs)
 
         yhats_stacked = torch.stack(yhats)
+        if return_retrieval_components:
+            return yhats_stacked, torch.stack(retrieval_yhats)
         return torch.mean(yhats_stacked, dim=0)
+
+    def _fit_adaptive_retrieval_alpha(
+        self,
+        X: np.ndarray | pd.DataFrame,
+        y: np.ndarray | pd.Series,
+        *,
+        n_outputs: int,
+    ) -> None:
+        self.retrieval_alpha_ = self.retrieval_alpha
+        if not self.retrieval_alpha_adaptive or not self.do_retrieval:
+            return
+
+        y_array = np.asarray(y).reshape(-1)
+        if self.val_max_samples is not None and len(y_array) > self.val_max_samples:
+            indices = np.random.default_rng(self.seed).choice(
+                len(y_array),
+                size=int(self.val_max_samples),
+                replace=False,
+            )
+            X = X.iloc[indices] if isinstance(X, pd.DataFrame) else X[indices]
+            y_array = y_array[indices]
+
+        with torch.no_grad():
+            main_outputs, retrieval_outputs = self._predict_ensemble(
+                X,
+                n_outputs=n_outputs,
+                return_retrieval_components=True,
+            )
+        main_outputs = main_outputs.detach().float().cpu()
+        retrieval_outputs = retrieval_outputs.detach().float().cpu()
+
+        candidates = set(float(alpha) for alpha in np.linspace(0.0, 1.0, 11))
+        candidates.add(float(self.retrieval_alpha))
+        lower_is_better = True
+        metric_name = "MSE"
+
+        if self.task_type == 'regression':
+            main_mean = main_outputs.mean(dim=0).reshape(-1).double()
+            retrieval_mean = retrieval_outputs.mean(dim=0).reshape(-1).double()
+            targets = torch.as_tensor(y_array, dtype=torch.float64)
+            delta = retrieval_mean - main_mean
+            denominator = float(torch.dot(delta, delta))
+            if denominator > torch.finfo(torch.float64).eps:
+                exact_alpha = float(torch.dot(delta, targets - main_mean)) / denominator
+                candidates.add(float(np.clip(exact_alpha, 0.0, 1.0)))
+
+            def score(alpha: float) -> float:
+                predictions = main_mean + alpha * delta
+                if self.clip_predictions_:
+                    predictions = predictions.clamp(self._train_min, self._train_max)
+                return float(torch.mean((targets - predictions) ** 2))
+
+        else:
+            targets = torch.as_tensor(y_array, dtype=torch.long)
+            val_metric = self.finetuning_classification_val_metric.lower()
+            if val_metric == 'auto':
+                val_metric = 'auc' if n_outputs == 2 else 'logloss'
+            if val_metric == 'auc':
+                lower_is_better = False
+                metric_name = "AUC"
+
+                def score(alpha: float) -> float:
+                    logits = (1.0 - alpha) * main_outputs + alpha * retrieval_outputs
+                    probabilities = torch.softmax(logits, dim=-1).mean(dim=0)
+                    return float(robust_roc_auc_score(y_array, probabilities.numpy()))
+
+            else:
+                metric_name = "LogLoss"
+
+                def score(alpha: float) -> float:
+                    logits = (1.0 - alpha) * main_outputs + alpha * retrieval_outputs
+                    probabilities = torch.softmax(logits, dim=-1).mean(dim=0)
+                    return float(
+                        -torch.log(
+                            probabilities[
+                                torch.arange(len(targets)),
+                                targets,
+                            ].clamp_min(1e-12)
+                        ).mean()
+                    )
+
+        scored = [(alpha, score(alpha)) for alpha in sorted(candidates)]
+        scored = [(alpha, value) for alpha, value in scored if np.isfinite(value)]
+        if not scored:
+            logger.warning("Adaptive retrieval alpha found no finite validation score.")
+            return
+        if lower_is_better:
+            selected_alpha, selected_score = min(
+                scored,
+                key=lambda item: (item[1], abs(item[0] - self.retrieval_alpha)),
+            )
+        else:
+            selected_alpha, selected_score = max(
+                scored,
+                key=lambda item: (item[1], -abs(item[0] - self.retrieval_alpha)),
+            )
+
+        self.retrieval_alpha_ = float(selected_alpha)
+        for predictor in self.predictors_:
+            predictor["retrieval_parameters"]["retrieval_alpha"] = self.retrieval_alpha_
+        logger.info(
+            "Adaptive retrieval alpha selected %.6f using validation %s %.8f.",
+            self.retrieval_alpha_,
+            metric_name,
+            selected_score,
+        )
 
 
 # =====================================================================
@@ -2073,11 +2222,12 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         tree_bagging_temperature: float | None = None,
         onehot_max_features: bool = True,
         do_retrieval: bool = True,
-        retrieval_alpha: float = 0.5,
+        retrieval_alpha: float = 0.75,
         retrieval_temperature: float = 1.5,
         retrieval_distance: str = 'cosine',
         retrieval_alpha_finetuning: bool = False,
         retrieval_temperature_finetuning: bool = False,
+        retrieval_alpha_adaptive: bool = True,
         logging_level: int | str = logging.WARNING,
         clip_predictions: bool = True,
         normalize_predictions: bool = False,
@@ -2195,6 +2345,18 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
                 return_partial_on_timeout=return_partial_on_timeout,
             )
             self._fit_succeeded = True
+            if self.retrieval_alpha_adaptive:
+                if eval_set_proc is None:
+                    logger.warning(
+                        "Adaptive retrieval alpha requires eval_set; using initial alpha %.6f.",
+                        self.retrieval_alpha,
+                    )
+                else:
+                    self._fit_adaptive_retrieval_alpha(
+                        eval_set_proc[0],
+                        eval_set_proc[1],
+                        n_outputs=self.n_outputs_,
+                    )
             if self.normalize_predictions_:
                 if eval_set_proc is None:
                     calibration_X, calibration_y = X, y_proc
@@ -2382,11 +2544,12 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         tree_bagging_temperature: float | None = None,
         onehot_max_features: bool = True,
         do_retrieval: bool = True,
-        retrieval_alpha: float = 0.5,
+        retrieval_alpha: float = 0.75,
         retrieval_temperature: float = 1.5,
         retrieval_distance: str = 'cosine',
         retrieval_alpha_finetuning: bool = False,
         retrieval_temperature_finetuning: bool = False,
+        retrieval_alpha_adaptive: bool = True,
         logging_level: int | str = logging.WARNING,
         clip_predictions: bool = True,          # ignored for classification
         normalize_predictions: bool = False,     # ignored for classification
@@ -2524,11 +2687,23 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
                 fit_time_cushion_frac=fit_time_cushion_frac,
                 return_partial_on_timeout=return_partial_on_timeout,
             )
+            self._fit_succeeded = True
+            if self.retrieval_alpha_adaptive:
+                if eval_set is None:
+                    logger.warning(
+                        "Adaptive retrieval alpha requires eval_set; using initial alpha %.6f.",
+                        self.retrieval_alpha,
+                    )
+                else:
+                    self._fit_adaptive_retrieval_alpha(
+                        eval_set[0],
+                        eval_set[1],
+                        n_outputs=self.n_outputs_,
+                    )
         except BaseException:
             self._invalidate_fitted_state()
             self._release_training_model()
             raise
-        self._fit_succeeded = True
         fit_total_end = time.time()
         fit_total_duration = fit_total_end - fit_start_time
         logger.debug(f"iLTMClassifier.fit END: Total fit duration={fit_total_duration:.2f}s")

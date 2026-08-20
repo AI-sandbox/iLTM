@@ -79,6 +79,7 @@ COMMON_PARAMETER_NAMES = (
     "clip_predictions",
     "corr_select_k",
     "retrieval_alpha_finetuning",
+    "retrieval_alpha_adaptive",
     "retrieval_temperature_finetuning",
 )
 
@@ -335,9 +336,8 @@ def get_hyperparameter_search_space(
             "forced_true_checkpoints": forced_retrieval_checkpoints,
         },
         "retrieval_alpha": {
-            "type": "float_uniform",
-            "low": 0.0,
-            "high": 1.0,
+            "type": "constant",
+            "value": 0.75,
             "condition": {"parameter": "do_retrieval", "value": True},
         },
         "retrieval_temperature": {
@@ -352,6 +352,7 @@ def get_hyperparameter_search_space(
             "condition": {"parameter": "do_retrieval", "value": True},
         },
         "retrieval_alpha_finetuning": {"type": "constant", "value": False},
+        "retrieval_alpha_adaptive": {"type": "constant", "value": True},
         "retrieval_temperature_finetuning": {"type": "constant", "value": False},
         "clip_data_value": {"type": "constant", "value": 1_000_000},
         "rf_size": {"type": "constant", "value": 32_768},

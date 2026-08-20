@@ -14,6 +14,7 @@ def _mock_calibrated_regressor(monkeypatch, raw_predict):
         device="cpu",
         finetuning=False,
         clip_predictions=False,
+        retrieval_alpha_adaptive=False,
     )
 
     def fit_common(*args, **kwargs):

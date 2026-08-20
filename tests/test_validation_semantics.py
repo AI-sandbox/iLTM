@@ -5,7 +5,11 @@ from iltm import iLTMClassifier
 
 
 def test_classifier_eval_labels_use_training_class_indices(monkeypatch):
-    classifier = iLTMClassifier(checkpoint=None, device="cpu")
+    classifier = iLTMClassifier(
+        checkpoint=None,
+        device="cpu",
+        retrieval_alpha_adaptive=False,
+    )
     captured = {}
 
     def capture_fit_common(X, y, **kwargs):
