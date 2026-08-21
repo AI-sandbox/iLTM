@@ -128,3 +128,36 @@ def test_catboost_oom_backoff_reraises_after_cpu_failure(monkeypatch):
         _tree("CatBoost", "classification")._fit_model(*_data("classification"))
 
     assert calls[-1]["task_type"] == "CPU"
+
+
+@pytest.mark.parametrize(
+    ("n_rows", "cat_features", "expected_task_type"),
+    [(1024, [0], "CPU"), (1025, [0], "GPU"), (2, [], "GPU")],
+)
+def test_catboost_small_categorical_data_uses_cpu(
+    monkeypatch,
+    n_rows,
+    cat_features,
+    expected_task_type,
+):
+    calls = []
+
+    class CatBoost:
+        def __init__(self, **params):
+            self.params = dict(params)
+            calls.append(self.params)
+
+        def fit(self, *args, **kwargs):
+            return self
+
+    monkeypatch.setattr(tree_embedding, "CatBoostClassifier", CatBoost)
+    monkeypatch.setattr(tree_embedding, "Pool", lambda *args, **kwargs: object())
+    monkeypatch.setattr(tree_embedding, "get_gpu_memory_info", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tree_embedding, "pick_gpu_ram_part", lambda *args, **kwargs: 0.8)
+
+    tree = _tree("CatBoost", "classification")
+    tree.cat_features = cat_features
+    X = pd.DataFrame({"feature": np.arange(n_rows)})
+    tree._fit_model(X, np.arange(n_rows) % 2)
+
+    assert calls[-1]["task_type"] == expected_task_type

@@ -520,6 +520,10 @@ class TreeEmbedding:
                 else: # device is 'cpu'
                     catboost_params['rsm'] = self.feature_fraction
 
+            if catboost_params['task_type'] == 'GPU' and self.cat_features and len(X) <= 1024:
+                catboost_params['task_type'] = 'CPU'
+                catboost_params.pop('devices', None)
+
             # Cap GPU memory use fraction based on what is currently free
             if catboost_params['task_type'] == 'GPU':
                 catboost_params['gpu_ram_part'] = pick_gpu_ram_part(self.device)
