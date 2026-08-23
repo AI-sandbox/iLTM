@@ -234,7 +234,7 @@ class _iLTMBase(BaseEstimator):
         auto_stop_on_low_cpu_memory: bool = True,
         cpu_memory_limit_gb: float | None = None,
         cpu_memory_safety_margin_gb: float = 2.0,
-        corr_select_k: int = 512,
+        corr_select_k: int = 0,
         inference_storage_dtype: str | None = "float16",
     ) -> None:
 
@@ -2247,7 +2247,7 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         auto_stop_on_low_cpu_memory: bool = True,
         cpu_memory_limit_gb: float | None = None,
         cpu_memory_safety_margin_gb: float = 2.0,
-        corr_select_k: int = 512,
+        corr_select_k: int = 0,
         inference_storage_dtype: str | None = "float16",
     ) -> None:
         params = locals().copy()
@@ -2570,7 +2570,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         auto_stop_on_low_cpu_memory: bool = True,
         cpu_memory_limit_gb: float | None = None,
         cpu_memory_safety_margin_gb: float = 2.0,
-        corr_select_k: int = 512,
+        corr_select_k: int = 0,
         inference_storage_dtype: str | None = "float16",
     ) -> None:
         params = locals().copy()
