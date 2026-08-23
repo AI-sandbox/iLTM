@@ -51,13 +51,13 @@ AVAILABLE_CHECKPOINTS = [
 ]
 
 DEFAULT_CHECKPOINT_WEIGHTS = {
-    "xgbrconcat": 4.0,
-    "cbrconcat": 10.0,
+    "xgbrconcat": 8.0,
+    "cbrconcat": 8.0,
     "r128bn": 1.0,
     "rnobn": 1.0,
     "xgb": 1.0,
     "catb": 2.0,
-    "rtr": 1.0,
+    "rtr": 4.0,
     "rtrcb": 1.0,
 }
 
@@ -313,6 +313,7 @@ def get_hyperparameter_search_space(
         "tree_n_estimators": {
             "type": "categorical",
             "choices": [100, 125, 150, 200],
+            "probs": [0.10, 0.35, 0.20, 0.35],
             "checkpoints": tree_checkpoints,
         },
         "tree_lr": {
@@ -395,19 +396,8 @@ def get_hyperparameter_search_space(
         },
         "corr_select_k": {
             "type": "categorical",
-            "choices": [0, 50, 100, 200, 300, 400, 512, 1024, 2048, 4096],
-            "probs": [
-                0.05,
-                0.025,
-                0.05,
-                0.075,
-                0.10,
-                0.20,
-                0.35,
-                0.075,
-                0.05,
-                0.025,
-            ],
+            "choices": [0, 512, 1024, 2048, 4096],
+            "probs": [0.40, 0.10, 0.15, 0.20, 0.15],
             "non_tree_embedding_choices": [
                 0,
                 5,

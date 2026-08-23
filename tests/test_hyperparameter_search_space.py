@@ -101,9 +101,10 @@ class TestSearchSpaceDefinition:
         spec = get_hyperparameter_search_space()["checkpoint"]
         probabilities = dict(zip(spec["choices"], spec["probs"]))
 
-        assert probabilities["cbrconcat"] == pytest.approx(10 / 21)
-        assert probabilities["xgbrconcat"] == pytest.approx(4 / 21)
-        assert probabilities["catb"] == pytest.approx(2 / 21)
+        assert probabilities["cbrconcat"] == pytest.approx(8 / 26)
+        assert probabilities["xgbrconcat"] == pytest.approx(8 / 26)
+        assert probabilities["rtr"] == pytest.approx(4 / 26)
+        assert probabilities["catb"] == pytest.approx(2 / 26)
         assert sum(probabilities.values()) == pytest.approx(1.0)
 
     def test_regression_prediction_clipping_is_preferred_but_optional(self):
@@ -144,20 +145,9 @@ class TestSearchSpaceDefinition:
     def test_corr_select_k_excludes_aggressive_small_positive_cutoffs(self):
         spec = get_hyperparameter_search_space()["corr_select_k"]
 
-        assert spec["choices"] == [0, 50, 100, 200, 300, 400, 512, 1024, 2048, 4096]
+        assert spec["choices"] == [0, 512, 1024, 2048, 4096]
         assert spec["probs"] == pytest.approx(
-            [
-                0.05,
-                0.025,
-                0.05,
-                0.075,
-                0.10,
-                0.20,
-                0.35,
-                0.075,
-                0.05,
-                0.025,
-            ]
+            [0.40, 0.10, 0.15, 0.20, 0.15]
         )
         assert spec["non_tree_embedding_choices"] == [
             0,
