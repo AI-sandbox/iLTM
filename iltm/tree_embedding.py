@@ -520,7 +520,11 @@ class TreeEmbedding:
                 else: # device is 'cpu'
                     catboost_params['rsm'] = self.feature_fraction
 
-            if catboost_params['task_type'] == 'GPU' and self.cat_features and len(X) <= 1024:
+            if (
+                catboost_params['task_type'] == 'GPU'
+                and len(X) <= 1024
+                and (self.cat_features or X.shape[1] >= 10_000)
+            ):
                 catboost_params['task_type'] = 'CPU'
                 catboost_params.pop('devices', None)
 
