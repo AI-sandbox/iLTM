@@ -22,6 +22,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.model_selection import train_test_split
+from sklearn.feature_selection import f_classif
 
 from iltm.iltm_model import iLTM
 from iltm.log_config import setup_logging
@@ -1058,7 +1059,6 @@ class _iLTMBase(BaseEstimator):
         else:
             y = np.array(y, dtype=np.float32)
 
-        # Correlation-based feature selection (posneg_topk strategy)
         if self.preprocessing == 'realmlp_td_s_v0':
             n_preprocessed_features = x_num.shape[1] + x_cat.shape[1]
         else:
@@ -1066,18 +1066,32 @@ class _iLTMBase(BaseEstimator):
 
         corr_select_k = min(self.corr_select_k, 20_000) if self.corr_select_k > 0 else 20_000
         if corr_select_k > 0 and n_preprocessed_features > corr_select_k:
-            logger.debug(f"Applying correlation-based feature selection: selecting up to {corr_select_k} features using posneg_topk strategy (only non-zero correlations)")
+            logger.debug(f"Applying target-based feature selection: selecting up to {corr_select_k} features")
             if self.preprocessing == 'realmlp_td_s_v0':
-                correlations = []
+                scores = []
                 for columns in (x_num, x_cat):
                     if columns.shape[1]:
-                        correlations.append(
-                            compute_feature_target_correlations(columns, y)
+                        scores.append(
+                            f_classif(columns, y)[0]
+                            if is_classification
+                            else compute_feature_target_correlations(columns, y)
                         )
-                r = np.concatenate(correlations)
+                scores = np.concatenate(scores)
             else:
-                r = compute_feature_target_correlations(x, y)
-            selected_indices = select_top_correlated_features(r, corr_select_k)
+                scores = (
+                    f_classif(x, y)[0]
+                    if is_classification
+                    else compute_feature_target_correlations(x, y)
+                )
+            if is_classification:
+                scores = np.nan_to_num(scores, nan=-np.inf)
+                selected_indices = np.sort(
+                    np.argsort(-scores, kind="stable")[:corr_select_k]
+                )
+            else:
+                selected_indices = select_top_correlated_features(
+                    scores, corr_select_k
+                )
             if self.preprocessing == 'realmlp_td_s_v0':
                 x = self._combine_preprocessed_columns(
                     x_num, x_cat, selected_indices

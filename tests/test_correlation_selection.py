@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 import iltm.inference_interface as inference_interface
-from iltm import iLTMRegressor
+from iltm import iLTMClassifier, iLTMRegressor
 from iltm.utils import select_top_correlated_features
 
 
@@ -30,6 +30,36 @@ def test_selection_returns_requested_number_of_features(num_features):
     selected = select_top_correlated_features(correlations, num_features)
 
     assert selected.size == num_features
+
+
+def test_classification_selection_is_invariant_to_class_labels():
+    rng = np.random.default_rng(7)
+    y = np.repeat(np.arange(3), 40)
+    X = np.eye(3)[y] + rng.normal(scale=0.2, size=(len(y), 3))
+    estimator = iLTMClassifier(
+        checkpoint=None,
+        device="cpu",
+        preprocessing="none",
+        corr_select_k=2,
+        adaptive_memory=False,
+    )
+
+    _, _, preprocessing = estimator._preprocess_fitting_data(
+        X,
+        y,
+        is_classification=True,
+    )
+    relabeled_y = np.array([0, 2, 1])[y]
+    _, _, relabeled_preprocessing = estimator._preprocess_fitting_data(
+        X,
+        relabeled_y,
+        is_classification=True,
+    )
+
+    np.testing.assert_array_equal(
+        preprocessing["corr_selected_indices"],
+        relabeled_preprocessing["corr_selected_indices"],
+    )
 
 
 @pytest.mark.parametrize("n_features", [100, 1_000, 10_000, 20_000])
