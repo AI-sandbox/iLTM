@@ -174,6 +174,7 @@ class _iLTMBase(BaseEstimator):
         gradient_clip_norm: float = 1.18,
         scheduler_min_lr: float = 6e-7,
         checkpoint: str | None = "xgbrconcat",
+        checkpoint_mix: tuple[str, ...] | list[str] | None = None,
         stratify_sampling: bool = False,
         feature_bagging: bool = False,
         feature_bagging_size: int = 3000,
@@ -243,10 +244,18 @@ class _iLTMBase(BaseEstimator):
         self.logging_level = logging_level
         setup_logging(logging_level=self.logging_level)
 
+        if checkpoint_mix is not None:
+            if isinstance(checkpoint_mix, str) or not isinstance(checkpoint_mix, (list, tuple)):
+                raise TypeError("checkpoint_mix must be a list or tuple of checkpoints.")
+            if not checkpoint_mix:
+                raise ValueError("checkpoint_mix must contain at least one checkpoint.")
+
+        primary_checkpoint = checkpoint_mix[0] if checkpoint_mix else checkpoint
+
         # Resolve model checkpoint config if provided
-        if checkpoint is not None:
+        if primary_checkpoint is not None:
             try:
-                checkpoint_config = resolve_model_checkpoint(checkpoint)
+                checkpoint_config = resolve_model_checkpoint(primary_checkpoint)
                 # Update parameters based on checkpoint configuration
                 for key, value in checkpoint_config.items():
                     if key == 'checkpoint':
@@ -312,6 +321,7 @@ class _iLTMBase(BaseEstimator):
         self.scheduler_min_lr = float(scheduler_min_lr)
 
         self.checkpoint = checkpoint
+        self.checkpoint_mix = checkpoint_mix
 
         self.stratify_sampling = bool(stratify_sampling)
         self.feature_bagging = bool(feature_bagging)
@@ -378,6 +388,35 @@ class _iLTMBase(BaseEstimator):
                 "retrieval_alpha_adaptive and retrieval_alpha_finetuning cannot both be enabled."
             )
 
+        self._checkpoint_mix_configs: List[dict[str, Any]] = []
+        if checkpoint_mix is not None:
+            if not self.tree_for_each_predictor:
+                raise ValueError("checkpoint_mix requires tree_for_each_predictor=True.")
+
+            for mixed_checkpoint in checkpoint_mix:
+                config = resolve_model_checkpoint(mixed_checkpoint)
+                mixed_config = {
+                    "checkpoint": config["checkpoint"],
+                    "preprocessing": config.get("preprocessing", self.preprocessing),
+                    "tree_embedding": bool(config.get("tree_embedding", self.tree_embedding)),
+                    "tree_model": config.get("tree_model", self.tree_model),
+                    "concat_tree_with_orig_features": bool(
+                        config.get(
+                            "concat_tree_with_orig_features",
+                            self.concat_tree_with_orig_features,
+                        )
+                    ),
+                    "bottleneck_size": int(config.get("bottleneck_size", self.bottleneck_size)),
+                    "do_retrieval": bool(config.get("do_retrieval", self.do_retrieval)),
+                }
+                if mixed_config["preprocessing"] != self.preprocessing:
+                    raise ValueError("All mixed checkpoints must use the same preprocessing.")
+                if mixed_config["bottleneck_size"] != self.bottleneck_size:
+                    raise ValueError("All mixed checkpoints must use the same network architecture.")
+                if mixed_config["do_retrieval"] != self.do_retrieval:
+                    raise ValueError("All mixed checkpoints must use the same retrieval setting.")
+                self._checkpoint_mix_configs.append(mixed_config)
+
         # These flags will be respected only for regression
         self.clip_predictions = bool(clip_predictions) if self.task_type == 'regression' else False
         self.normalize_predictions = bool(normalize_predictions) if self.task_type == 'regression' else False
@@ -406,7 +445,7 @@ class _iLTMBase(BaseEstimator):
         self._inference_storage_torch_dtype = self._resolve_inference_storage_dtype(inference_storage_dtype)
 
         # Placeholders
-        self.tr_: TreeEmbedding | List[TreeEmbedding] | None = None
+        self.tr_: TreeEmbedding | List[TreeEmbedding | None] | None = None
         seed_everything(self.seed)
 
         self.model_path = self.checkpoint
@@ -414,6 +453,7 @@ class _iLTMBase(BaseEstimator):
 
         self.predictors_: List[dict] = []
         self.preprocessors_: List[dict] = []
+        self.predictor_configs_: List[dict] = []
 
     @staticmethod
     def _resolve_inference_storage_dtype(dtype: str | torch.dtype | None) -> torch.dtype | None:
@@ -656,6 +696,7 @@ class _iLTMBase(BaseEstimator):
         self._fit_succeeded = False
         self.predictors_ = []
         self.preprocessors_ = []
+        self.predictor_configs_ = []
         self.tr_ = None
         self.__dict__.pop("_prediction_calibration_slope_", None)
         self.__dict__.pop("_prediction_calibration_intercept_", None)
@@ -1604,6 +1645,28 @@ class _iLTMBase(BaseEstimator):
 
         return X_tree, y_tree, X, y
 
+    def _create_tree_embedding(self, *, tree_model: str, seed: int) -> TreeEmbedding:
+        return TreeEmbedding(
+            tree_model=tree_model,
+            cat_features=self.cat_features,
+            seed=seed,
+            task_type=self.task_type,
+            n_estimators=self.tree_n_estimators,
+            lr=self.tree_lr,
+            max_depth=self.tree_max_depth,
+            min_samples_leaf=self.tree_min_samples_leaf,
+            subsample=self.tree_subsample,
+            feature_fraction=self.tree_feature_fraction,
+            device=str(self.device) if hasattr(self.device, '__str__') else self.device,
+            use_default_params=self.tree_use_default_params,
+            select_best_model=self.tree_select_best_model,
+            max_leaves=self.tree_max_leaves,
+            gamma=self.tree_gamma,
+            l2_leaf_reg=self.tree_l2_leaf_reg,
+            bagging_temperature=self.tree_bagging_temperature,
+            onehot_max_features=self.onehot_max_features,
+        )
+
     # -----------------------------
     # Shared fit body
     # -----------------------------
@@ -1621,6 +1684,7 @@ class _iLTMBase(BaseEstimator):
         # Reset state
         self.predictors_ = []
         self.preprocessors_ = []
+        self.predictor_configs_ = []
         seed_everything(self.seed)
         self._auto_tune_for_memory()
         
@@ -1649,9 +1713,12 @@ class _iLTMBase(BaseEstimator):
             self.normalize_predictions_ = False
 
         # Model required
-        if self.checkpoint is None:
+        if self.checkpoint is None and not self._checkpoint_mix_configs:
             raise ValueError("checkpoint must be provided.")
-        self.model_path = self.checkpoint or self.model_path
+        if self._checkpoint_mix_configs:
+            self.model_path = self._checkpoint_mix_configs[0]["checkpoint"]
+        else:
+            self.model_path = self.checkpoint or self.model_path
         self._model = self._initialize_model()
         self._inference_model_config_ = {
             "pca_sampling": self._model.pca_sampling,
@@ -1661,49 +1728,19 @@ class _iLTMBase(BaseEstimator):
 
         # TreeEmbedding creation
         self.tr_ = None
-        if self.tree_embedding:
+        if self._checkpoint_mix_configs:
+            self.tr_ = []
+        elif self.tree_embedding:
             if not self.tree_for_each_predictor:
-                self.tr_ = TreeEmbedding(
+                self.tr_ = self._create_tree_embedding(
                     tree_model=self.tree_model,
-                    cat_features=self.cat_features,
                     seed=self.seed,
-                    task_type=self.task_type,
-                    n_estimators=self.tree_n_estimators,
-                    lr=self.tree_lr,
-                    max_depth=self.tree_max_depth,
-                    min_samples_leaf=self.tree_min_samples_leaf,
-                    subsample=self.tree_subsample,
-                    feature_fraction=self.tree_feature_fraction,
-                    device=str(self.device) if hasattr(self.device, '__str__') else self.device,
-                    use_default_params=self.tree_use_default_params,
-                    select_best_model=self.tree_select_best_model,
-                    max_leaves=self.tree_max_leaves,
-                    gamma=self.tree_gamma,
-                    l2_leaf_reg=self.tree_l2_leaf_reg,
-                    bagging_temperature=self.tree_bagging_temperature,
-                    onehot_max_features=self.onehot_max_features
                 )
             else:
                 self.tr_ = [
-                    TreeEmbedding(
+                    self._create_tree_embedding(
                         tree_model=self.tree_model,
-                        cat_features=self.cat_features,
                         seed=self.seed + i,
-                        task_type=self.task_type,
-                        n_estimators=self.tree_n_estimators,
-                        lr=self.tree_lr,
-                        max_depth=self.tree_max_depth,
-                        min_samples_leaf=self.tree_min_samples_leaf,
-                        subsample=self.tree_subsample,
-                        feature_fraction=self.tree_feature_fraction,
-                        device=str(self.device) if hasattr(self.device, '__str__') else self.device,
-                        use_default_params=self.tree_use_default_params,
-                        select_best_model=self.tree_select_best_model,
-                        max_leaves=self.tree_max_leaves,
-                        gamma=self.tree_gamma,
-                        l2_leaf_reg=self.tree_l2_leaf_reg,
-                        bagging_temperature=self.tree_bagging_temperature,
-                        onehot_max_features=self.onehot_max_features
                     ) for i in range(self.n_ensemble)
                 ]
 
@@ -1755,7 +1792,9 @@ class _iLTMBase(BaseEstimator):
             X_val_work = X_val_original if X_val_original is not None else None
 
         # Preprocess once if not per-predictor-tree
-        if not (self.tree_embedding and self.tree_for_each_predictor):
+        if not self._checkpoint_mix_configs and not (
+            self.tree_embedding and self.tree_for_each_predictor
+        ):
             X_np, y_np, preproc = self._preprocess_fitting_data(X_work, y_work, is_classification=self.task_type == 'classification')
             self.preprocessors_.append(preproc)
             if X_val_work is not None:
@@ -1823,34 +1862,81 @@ class _iLTMBase(BaseEstimator):
 
             logger.info(f"Generating predictor {i + 1} of {self.n_ensemble}...")
             t_pred_start = time.time()
-            if self.tree_embedding and self.tree_for_each_predictor:
-                # Per-predictor tree path
-                X_tree, y_tree, X_for_nn, y_for_nn = self._split_data_tree_embedding(
-                    X_original, y_proc, random_state=self.seed + i
+
+            mixed_config = None
+            if self._checkpoint_mix_configs:
+                mixed_config = self._checkpoint_mix_configs[
+                    i % len(self._checkpoint_mix_configs)
+                ]
+                mixed_model_path = mixed_config["checkpoint"]
+                if self.model_path != mixed_model_path:
+                    self._release_training_model()
+                    self.model_path = mixed_model_path
+                    self._model = self._initialize_model()
+                self.predictor_configs_.append(mixed_config.copy())
+
+            per_predictor_preprocessing = bool(mixed_config) or (
+                self.tree_embedding and self.tree_for_each_predictor
+            )
+            if per_predictor_preprocessing:
+                predictor_tree_embedding = (
+                    mixed_config["tree_embedding"]
+                    if mixed_config is not None
+                    else self.tree_embedding
                 )
-                self.tr_[i].fit_tree(X_tree, y_tree, eval_set=tree_eval_set, concat_with_orig_features=self.concat_tree_with_orig_features)
+                predictor_concat = (
+                    mixed_config["concat_tree_with_orig_features"]
+                    if mixed_config is not None
+                    else self.concat_tree_with_orig_features
+                )
 
-                X_emb_tr = self.tr_[i].transform(X_for_nn)
-                X_emb_val = self.tr_[i].transform(X_val_original) if X_val_original is not None else None
-
-                if self.concat_tree_with_orig_features:
-                    X_for_nn = self._select_original_features_for_tree(self.tr_[i], X_for_nn)
-                    X_fit = self._concatenate_original_and_tree_features(
-                        X_for_nn, X_emb_tr
-                    )
-                    if X_val_original is not None and X_emb_val is not None:
-                        X_val_work = self._select_original_features_for_tree(
-                            self.tr_[i],
-                            X_val_original,
+                if mixed_config is not None:
+                    tree = None
+                    if predictor_tree_embedding:
+                        tree = self._create_tree_embedding(
+                            tree_model=mixed_config["tree_model"],
+                            seed=self.seed + i,
                         )
-                        X_val_fit = self._concatenate_original_and_tree_features(
-                            X_val_work, X_emb_val
-                        )
-                    else:
-                        X_val_fit = None
+                    self.tr_.append(tree)  # type: ignore[union-attr]
                 else:
-                    X_fit = X_emb_tr
-                    X_val_fit = X_emb_val
+                    tree = self.tr_[i]  # type: ignore[index]
+
+                if predictor_tree_embedding:
+                    X_tree, y_tree, X_for_nn, y_for_nn = self._split_data_tree_embedding(
+                        X_original, y_proc, random_state=self.seed + i
+                    )
+                    tree.fit_tree(
+                        X_tree,
+                        y_tree,
+                        eval_set=tree_eval_set,
+                        concat_with_orig_features=predictor_concat,
+                    )
+
+                    X_emb_tr = tree.transform(X_for_nn)
+                    X_emb_val = tree.transform(X_val_original) if X_val_original is not None else None
+
+                    if predictor_concat:
+                        X_for_nn = self._select_original_features_for_tree(tree, X_for_nn)
+                        X_fit = self._concatenate_original_and_tree_features(
+                            X_for_nn, X_emb_tr
+                        )
+                        if X_val_original is not None and X_emb_val is not None:
+                            X_val_work = self._select_original_features_for_tree(
+                                tree,
+                                X_val_original,
+                            )
+                            X_val_fit = self._concatenate_original_and_tree_features(
+                                X_val_work, X_emb_val
+                            )
+                        else:
+                            X_val_fit = None
+                    else:
+                        X_fit = X_emb_tr
+                        X_val_fit = X_emb_val
+                else:
+                    X_fit = X_original
+                    y_for_nn = y_proc
+                    X_val_fit = X_val_original
 
                 X_np, y_np, preproc = self._preprocess_fitting_data(X_fit, y_for_nn, is_classification=self.task_type == 'classification')
                 self.preprocessors_.append(preproc)
@@ -1966,14 +2052,36 @@ class _iLTMBase(BaseEstimator):
 
         # If we can preprocess once, do it
         preprocessed_once: Optional[Tensor] = None
-        if not (self.tree_embedding and self.tree_for_each_predictor):
+        if not self._checkpoint_mix_configs and not (
+            self.tree_embedding and self.tree_for_each_predictor
+        ):
             preprocessed_once = self._preprocess_for_predict_once(X_original)
 
         yhats: List[Tensor] = []
         retrieval_yhats: List[Tensor] = []
 
         for i, predictor in enumerate(self.predictors_):
-            if self.tree_embedding and self.tree_for_each_predictor:
+            per_predictor_preprocessing = bool(self._checkpoint_mix_configs) or (
+                self.tree_embedding and self.tree_for_each_predictor
+            )
+            if per_predictor_preprocessing:
+                mixed_config = (
+                    self.predictor_configs_[i]
+                    if self._checkpoint_mix_configs
+                    else None
+                )
+                predictor_tree_embedding = (
+                    mixed_config["tree_embedding"]
+                    if mixed_config is not None
+                    else self.tree_embedding
+                )
+                predictor_concat = (
+                    mixed_config["concat_tree_with_orig_features"]
+                    if mixed_config is not None
+                    else self.concat_tree_with_orig_features
+                )
+                tree = self.tr_[i]  # type: ignore[index]
+
                 # Chunked per predictor path
                 n_samples = X_original.shape[0] if isinstance(X_original, np.ndarray) else len(X_original)
                 try:
@@ -1991,17 +2099,20 @@ class _iLTMBase(BaseEstimator):
                     for start in range(0, n_samples, chunk_rows):
                         end = min(start + chunk_rows, n_samples)
                         X_batch_orig = X_original.iloc[start:end] if isinstance(X_original, pd.DataFrame) else X_original[start:end]
-                        X_emb = self.tr_[i].transform(X_batch_orig)
-                        if self.concat_tree_with_orig_features:
-                            X_batch_base = self._select_original_features_for_tree(
-                                self.tr_[i],
-                                X_batch_orig,
-                            )
-                            X_batch = self._concatenate_original_and_tree_features(
-                                X_batch_base, X_emb
-                            )
+                        if predictor_tree_embedding:
+                            X_emb = tree.transform(X_batch_orig)
+                            if predictor_concat:
+                                X_batch_base = self._select_original_features_for_tree(
+                                    tree,
+                                    X_batch_orig,
+                                )
+                                X_batch = self._concatenate_original_and_tree_features(
+                                    X_batch_base, X_emb
+                                )
+                            else:
+                                X_batch = X_emb
                         else:
-                            X_batch = X_emb
+                            X_batch = X_batch_orig
 
                         X_tensor = self._preprocess_test_data(X_batch, self.preprocessors_[i])
                         out = self._forward_pass_predictor(
@@ -2200,6 +2311,7 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         gradient_clip_norm: float = 1.18,
         scheduler_min_lr: float = 6e-7,
         checkpoint: str | None = "xgbrconcat",
+        checkpoint_mix: tuple[str, ...] | list[str] | None = None,
         stratify_sampling: bool = False,
         feature_bagging: bool = False,
         feature_bagging_size: int = 3000,
@@ -2522,6 +2634,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         gradient_clip_norm: float = 1.18,
         scheduler_min_lr: float = 6e-7,
         checkpoint: str | None = "xgbrconcat",
+        checkpoint_mix: tuple[str, ...] | list[str] | None = None,
         stratify_sampling: bool = False,
         feature_bagging: bool = False,
         feature_bagging_size: int = 3000,
