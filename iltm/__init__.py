@@ -2,6 +2,7 @@ from importlib.metadata import version
 
 from .inference_interface import iLTMRegressor, iLTMClassifier
 from .hyperparameter_search_space import (
+    get_hyperparameter_configs,
     get_hyperparameter_search_space,
     sample_hyperparameters,
     AVAILABLE_CHECKPOINTS,
@@ -15,6 +16,7 @@ except ImportError:
 __all__ = [
     'iLTMRegressor',
     'iLTMClassifier',
+    'get_hyperparameter_configs',
     'get_hyperparameter_search_space',
     'sample_hyperparameters',
     'AVAILABLE_CHECKPOINTS',

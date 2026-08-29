@@ -22,6 +22,10 @@ High level API
     adaptive search strategies you will usually want your tuning framework
     to sample configurations directly using `get_hyperparameter_search_space`.
 
+- get_hyperparameter_configs()
+
+    Returns the recommended fixed portfolio of configurations.
+
 Notes
 -----
 
@@ -37,6 +41,8 @@ recommended for typical workloads.
 
 from typing import Dict, Any
 import numpy as np
+
+from .hyperparameter_configs import get_hyperparameter_configs
 
 
 AVAILABLE_CHECKPOINTS = [
@@ -55,10 +61,10 @@ DEFAULT_CHECKPOINT_WEIGHTS = {
     "cbrconcat": 8.0,
     "r128bn": 1.0,
     "rnobn": 1.0,
-    "xgb": 1.0,
-    "catb": 2.0,
+    "xgb": 0.0,
+    "catb": 0.0,
     "rtr": 4.0,
-    "rtrcb": 1.0,
+    "rtrcb": 0.0,
 }
 
 NON_TREE_CHECKPOINTS = ("r128bn", "rnobn", "rtr")
@@ -491,5 +497,6 @@ __all__ = [
     "HyperparamSpec",
     "SearchSpace",
     "get_hyperparameter_search_space",
+    "get_hyperparameter_configs",
     "sample_hyperparameters",
 ]

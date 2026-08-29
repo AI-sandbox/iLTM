@@ -8,12 +8,16 @@ These tests focus on:
 - Basic integration that sampled configs can be used with iLTM models.
 """
 
+import inspect
+import json
+
 import numpy as np
 import pytest
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score, roc_auc_score
 
 from iltm import (
+    get_hyperparameter_configs,
     get_hyperparameter_search_space,
     sample_hyperparameters,
     iLTMRegressor,
@@ -46,6 +50,42 @@ RETRIEVAL_PARAMETERS = {
     "retrieval_temperature",
     "retrieval_distance",
 }
+
+
+class TestHyperparameterConfigs:
+    def test_portfolio_is_complete_name_free_and_unique(self):
+        configs = get_hyperparameter_configs()
+
+        assert len(configs) == 25
+        assert all("name" not in config for config in configs)
+        assert len({json.dumps(config, sort_keys=True) for config in configs}) == 25
+
+    def test_portfolio_contains_established_singles_and_mixed_twins(self):
+        configs = get_hyperparameter_configs()
+
+        for single, mixed in zip(configs[:6], configs[6:12], strict=True):
+            expected = dict(single)
+            expected["checkpoint_mix"] = mixed["checkpoint_mix"]
+            assert mixed == expected
+            assert len(mixed["checkpoint_mix"]) == mixed["n_ensemble"]
+
+        assert sum("checkpoint_mix" in config for config in configs) == 15
+
+    def test_portfolio_configs_are_valid_estimator_parameters(self):
+        valid_parameters = set(inspect.signature(iLTMRegressor).parameters)
+
+        for config in get_hyperparameter_configs():
+            assert set(config) <= valid_parameters
+            assert config["scheduler_min_lr"] <= config["finetuning_lr"]
+
+    def test_portfolio_returns_defensive_copies(self):
+        first = get_hyperparameter_configs()
+        first[0]["checkpoint"] = "changed"
+        first[6]["checkpoint_mix"].append("changed")
+
+        second = get_hyperparameter_configs()
+        assert second[0]["checkpoint"] == "xgbrconcat"
+        assert len(second[6]["checkpoint_mix"]) == second[6]["n_ensemble"]
 
 
 class TestSearchSpaceDefinition:
@@ -101,10 +141,12 @@ class TestSearchSpaceDefinition:
         spec = get_hyperparameter_search_space()["checkpoint"]
         probabilities = dict(zip(spec["choices"], spec["probs"]))
 
-        assert probabilities["cbrconcat"] == pytest.approx(8 / 26)
-        assert probabilities["xgbrconcat"] == pytest.approx(8 / 26)
-        assert probabilities["rtr"] == pytest.approx(4 / 26)
-        assert probabilities["catb"] == pytest.approx(2 / 26)
+        assert probabilities["cbrconcat"] == pytest.approx(8 / 22)
+        assert probabilities["xgbrconcat"] == pytest.approx(8 / 22)
+        assert probabilities["rtr"] == pytest.approx(4 / 22)
+        assert probabilities["xgb"] == 0
+        assert probabilities["catb"] == 0
+        assert probabilities["rtrcb"] == 0
         assert sum(probabilities.values()) == pytest.approx(1.0)
 
     def test_regression_prediction_clipping_is_preferred_but_optional(self):
