@@ -317,7 +317,7 @@ def get_hyperparameter_search_space(
             "checkpoints": tree_checkpoints,
         },
         "tree_lr": {
-            "type": "log_uniform",
+            "type": "float_uniform",
             "low": 5e-2,
             "high": 0.7,
             "checkpoints": tree_checkpoints,

@@ -120,6 +120,7 @@ class TestSearchSpaceDefinition:
         space = get_hyperparameter_search_space()
 
         assert space["n_ensemble"] == {"type": "categorical", "choices": [8, 12]}
+        assert space["tree_lr"]["type"] == "float_uniform"
         assert space["finetuning_max_steps"] == {"type": "constant", "value": 2048}
         assert space["finetuning_batch_size"]["choices"] == [1024, 2048]
         assert space["max_train_batches_per_epoch"]["value"] == 128
