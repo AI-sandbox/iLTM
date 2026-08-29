@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from sklearn.base import BaseEstimator, RegressorMixin, ClassifierMixin
 from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
 from sklearn.utils.multiclass import check_classification_targets
-from sklearn.utils import column_or_1d
+from sklearn.utils import column_or_1d, resample
 from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -169,6 +169,7 @@ class _iLTMBase(BaseEstimator):
         finetuning_subset_frac: float | None = None,
         finetuning_subset_max_samples: int | None = 100_000,
         val_max_samples: int | None = 25_000,
+        val_subsample_before_preprocessing: bool = True,
         min_epochs: int = 0,
         cooldown_checks: int = 2,
         gradient_clip_norm: float = 1.18,
@@ -315,6 +316,7 @@ class _iLTMBase(BaseEstimator):
         self.finetuning_subset_frac = finetuning_subset_frac
         self.finetuning_subset_max_samples = finetuning_subset_max_samples
         self.val_max_samples = val_max_samples
+        self.val_subsample_before_preprocessing = bool(val_subsample_before_preprocessing)
         self.min_epochs = int(min_epochs)
         self.cooldown_checks = int(cooldown_checks)
         self.gradient_clip_norm = float(gradient_clip_norm)
@@ -1667,6 +1669,50 @@ class _iLTMBase(BaseEstimator):
             onehot_max_features=self.onehot_max_features,
         )
 
+    def _subsample_external_validation(
+        self,
+        X_val: np.ndarray | pd.DataFrame,
+        y_val: np.ndarray | pd.Series,
+    ) -> tuple[np.ndarray | pd.DataFrame, np.ndarray | pd.Series]:
+        """Cap an external validation set before per-predictor transforms."""
+        if (
+            not self.val_subsample_before_preprocessing
+            or self.val_max_samples is None
+            or len(y_val) <= int(self.val_max_samples)
+        ):
+            return X_val, y_val
+
+        n_samples = int(self.val_max_samples)
+        if n_samples <= 0:
+            raise ValueError("val_max_samples must be positive or None.")
+
+        y_array = np.asarray(y_val).reshape(-1)
+        indices = np.arange(len(y_array))
+        stratify_by = None
+        if self.task_type == "classification":
+            stratify_by = check_stratification(
+                y_array,
+                stratify=True,
+                task_type="classification",
+            )
+        selected = resample(
+            indices,
+            replace=False,
+            n_samples=n_samples,
+            random_state=self.seed,
+            stratify=stratify_by,
+        )
+        selected = np.sort(selected)
+
+        X_subset = X_val.iloc[selected] if isinstance(X_val, pd.DataFrame) else X_val[selected]
+        y_subset = y_val.iloc[selected] if isinstance(y_val, pd.Series) else y_val[selected]
+        logger.debug(
+            "Subsampled external validation before preprocessing: %d -> %d rows.",
+            len(y_array),
+            n_samples,
+        )
+        return X_subset, y_subset
+
     # -----------------------------
     # Shared fit body
     # -----------------------------
@@ -1747,6 +1793,10 @@ class _iLTMBase(BaseEstimator):
         # Eval set unpack and normalize target once
         if eval_set is not None:
             X_val_original, y_val_proc = eval_set
+            X_val_original, y_val_proc = self._subsample_external_validation(
+                X_val_original,
+                y_val_proc,
+            )
             # choose dtype by task
             y_val_np = _as_numpy_1d(
                 y_val_proc,
@@ -2306,6 +2356,7 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         finetuning_subset_frac: float | None = None,
         finetuning_subset_max_samples: int | None = 100_000,
         val_max_samples: int | None = 25_000,
+        val_subsample_before_preprocessing: bool = True,
         min_epochs: int = 0,
         cooldown_checks: int = 2,
         gradient_clip_norm: float = 1.18,
@@ -2629,6 +2680,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         finetuning_subset_frac: float | None = None,
         finetuning_subset_max_samples: int | None = 100_000,
         val_max_samples: int | None = 25_000,
+        val_subsample_before_preprocessing: bool = True,
         min_epochs: int = 0,
         cooldown_checks: int = 2,
         gradient_clip_norm: float = 1.18,

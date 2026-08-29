@@ -17,6 +17,7 @@ class TestSklearnAPI:
         assert estimator.max_train_batches_per_epoch == 128
         assert estimator.finetuning_subset_max_samples == 100_000
         assert estimator.val_max_samples == 25_000
+        assert estimator.val_subsample_before_preprocessing is True
 
     @pytest.mark.parametrize("estimator_class", [iLTMClassifier, iLTMRegressor])
     def test_scheduler_min_lr_cannot_exceed_finetuning_lr(self, estimator_class):
