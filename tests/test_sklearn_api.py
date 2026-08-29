@@ -16,8 +16,36 @@ class TestSklearnAPI:
         assert estimator.finetuning_batch_size == 2048
         assert estimator.max_train_batches_per_epoch == 128
         assert estimator.finetuning_subset_max_samples == 100_000
+        assert estimator.val_checks_per_epoch_target == "auto"
         assert estimator.val_max_samples == 25_000
         assert estimator.val_subsample_before_preprocessing is True
+
+    @pytest.mark.parametrize("estimator_class", [iLTMClassifier, iLTMRegressor])
+    def test_validation_check_target_accepts_explicit_overrides(self, estimator_class):
+        assert estimator_class(
+            checkpoint=None,
+            device="cpu",
+            val_checks_per_epoch_target=2,
+        ).val_checks_per_epoch_target == 2
+        assert estimator_class(
+            checkpoint=None,
+            device="cpu",
+            val_checks_per_epoch_target=4,
+        ).val_checks_per_epoch_target == 4
+
+    @pytest.mark.parametrize("invalid", [0, -1, "adaptive"])
+    @pytest.mark.parametrize("estimator_class", [iLTMClassifier, iLTMRegressor])
+    def test_validation_check_target_rejects_invalid_values(
+        self,
+        estimator_class,
+        invalid,
+    ):
+        with pytest.raises(ValueError, match="positive integer or 'auto'"):
+            estimator_class(
+                checkpoint=None,
+                device="cpu",
+                val_checks_per_epoch_target=invalid,
+            )
 
     @pytest.mark.parametrize("estimator_class", [iLTMClassifier, iLTMRegressor])
     def test_scheduler_min_lr_cannot_exceed_finetuning_lr(self, estimator_class):

@@ -4,7 +4,7 @@ import os
 import gc
 import math
 import logging
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict, Any, Literal
 import time
 
 import requests
@@ -49,6 +49,36 @@ torch.set_float32_matmul_precision("high")  # enables TF32 on Ampere+
 torch.backends.cuda.matmul.allow_tf32 = True
 
 logger = logging.getLogger(__name__)
+
+_AUTO_VAL_CHECKS_FULL = 4
+_AUTO_VAL_CHECKS_REDUCED = 2
+_AUTO_VAL_CHECKS_SMALL_TRAIN_MAX_ROWS = 25_000
+
+
+def _should_reduce_auto_val_checks(
+    *,
+    train_rows: int,
+    predictor_times: list[float],
+    remaining_time: float | None,
+    predictors_left: int,
+    time_cushion_frac: float = 0.0,
+) -> bool:
+    """Return whether a large-fold ensemble is projected to miss its target."""
+    if (
+        train_rows <= _AUTO_VAL_CHECKS_SMALL_TRAIN_MAX_ROWS
+        or not predictor_times
+        or remaining_time is None
+        or predictors_left <= 0
+    ):
+        return False
+
+    average_predictor_time = sum(predictor_times) / len(predictor_times)
+    projected_time = (
+        average_predictor_time
+        * predictors_left
+        * (1.0 + max(0.0, time_cushion_frac))
+    )
+    return projected_time > remaining_time
 
 
 class PermutationImportanceMixin:
@@ -163,7 +193,7 @@ class _iLTMBase(BaseEstimator):
         early_stopping_mode: str = "auto",
         patience_epochs: int = 50,
         patience_checks: int | None = None,
-        val_checks_per_epoch_target: int = 4,
+        val_checks_per_epoch_target: int | Literal["auto"] = "auto",
         val_check_interval_batches: int | None = None,
         max_train_batches_per_epoch: int | None = 128,
         finetuning_subset_frac: float | None = None,
@@ -310,7 +340,18 @@ class _iLTMBase(BaseEstimator):
         self.early_stopping_mode = early_stopping_mode
         self.patience_epochs = int(patience_epochs)
         self.patience_checks = None if patience_checks is None else int(patience_checks)
-        self.val_checks_per_epoch_target = int(val_checks_per_epoch_target)
+        if val_checks_per_epoch_target == "auto":
+            self.val_checks_per_epoch_target = "auto"
+        else:
+            if isinstance(val_checks_per_epoch_target, str):
+                raise ValueError(
+                    "val_checks_per_epoch_target must be a positive integer or 'auto'."
+                )
+            self.val_checks_per_epoch_target = int(val_checks_per_epoch_target)
+            if self.val_checks_per_epoch_target <= 0:
+                raise ValueError(
+                    "val_checks_per_epoch_target must be a positive integer or 'auto'."
+                )
         self.val_check_interval_batches = val_check_interval_batches
         self.max_train_batches_per_epoch = None if max_train_batches_per_epoch is None else int(max_train_batches_per_epoch)
         self.finetuning_subset_frac = finetuning_subset_frac
@@ -1344,6 +1385,7 @@ class _iLTMBase(BaseEstimator):
         y_val: Tensor | None = None,
         fit_deadline: float | None = None,
         fit_time_cushion_frac: float = 0.001,    # (0.1% headroom)
+        val_checks_per_epoch_target: int = _AUTO_VAL_CHECKS_FULL,
     ) -> dict | None:
         X_pred, y_pred, feature_bagging_idxs = self._sample_data(X, y, pca_sampling=self.pca_sampling)
         X_pred, y_pred = (
@@ -1395,7 +1437,7 @@ class _iLTMBase(BaseEstimator):
                         gradient_clip_norm=self.gradient_clip_norm, scheduler_min_lr=self.scheduler_min_lr,
                         use_amp_finetuning=cur_amp, early_stopping_mode=self.early_stopping_mode,
                         patience_epochs=self.patience_epochs, patience_checks=self.patience_checks,
-                        val_checks_per_epoch_target=self.val_checks_per_epoch_target,
+                        val_checks_per_epoch_target=val_checks_per_epoch_target,
                         max_train_batches_per_epoch=self.max_train_batches_per_epoch,
                         finetuning_subset_frac=self.finetuning_subset_frac,
                         finetuning_subset_max_samples=self.finetuning_subset_max_samples,
@@ -1859,6 +1901,24 @@ class _iLTMBase(BaseEstimator):
                 X_tensor, y_tensor = torch.from_numpy(X_np), torch.from_numpy(y_np)
 
         predictor_times: list[float] = []
+        auto_val_checks = self.val_checks_per_epoch_target == "auto"
+        effective_val_checks = (
+            _AUTO_VAL_CHECKS_FULL
+            if auto_val_checks
+            else int(self.val_checks_per_epoch_target)
+        )
+        train_fold_rows = len(y_proc)
+        small_train_fold = (
+            auto_val_checks
+            and train_fold_rows <= _AUTO_VAL_CHECKS_SMALL_TRAIN_MAX_ROWS
+        )
+        if small_train_fold:
+            logger.info(
+                "Adaptive validation checks: using 4 checks for all predictors "
+                "because the training fold has %d rows (<= %d).",
+                train_fold_rows,
+                _AUTO_VAL_CHECKS_SMALL_TRAIN_MAX_ROWS,
+            )
 
         # Generate predictors
         for i in range(self.n_ensemble):
@@ -2021,6 +2081,7 @@ class _iLTMBase(BaseEstimator):
                 y_val=y_val_tensor,
                 fit_deadline=fit_deadline,
                 fit_time_cushion_frac=fit_time_cushion_frac,
+                val_checks_per_epoch_target=effective_val_checks,
             )
             gc.collect()
 
@@ -2031,6 +2092,30 @@ class _iLTMBase(BaseEstimator):
                 logger.debug(f"_fit_common: Predictor {i+1} completed in {pred_duration:.2f}s, timed_out={pred['timed_out']}, remaining={remaining_after_pred:.2f}s")
             else:
                 logger.debug(f"_fit_common: Predictor {i+1} completed in {pred_duration:.2f}s, timed_out={pred['timed_out']}")
+
+            predictors_left = self.n_ensemble - (i + 1)
+            if (
+                auto_val_checks
+                and effective_val_checks == _AUTO_VAL_CHECKS_FULL
+                and self.finetuning
+                and not pred["timed_out"]
+                and _should_reduce_auto_val_checks(
+                    train_rows=train_fold_rows,
+                    predictor_times=predictor_times,
+                    remaining_time=remaining_after_pred,
+                    predictors_left=predictors_left,
+                    time_cushion_frac=fit_time_cushion_frac,
+                )
+            ):
+                effective_val_checks = _AUTO_VAL_CHECKS_REDUCED
+                logger.info(
+                    "Adaptive validation checks: reducing subsequent predictors "
+                    "from 4 to 2 checks because %d predictors remain and the "
+                    "current average predictor time is %.2fs.",
+                    predictors_left,
+                    sum(predictor_times) / len(predictor_times),
+                )
+                predictor_times.clear()
             # Always keep the predictor if either it didn't time out, or we allow partial on timeout,
             # or it's the very first predictor (to avoid returning an empty model).
             if (not pred["timed_out"]) or return_partial_on_timeout or (pred["timed_out"] and len(self.predictors_) == 0):
@@ -2350,7 +2435,7 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         early_stopping_mode: str = "auto",
         patience_epochs: int = 50,
         patience_checks: int | None = None,
-        val_checks_per_epoch_target: int = 4,
+        val_checks_per_epoch_target: int | Literal["auto"] = "auto",
         val_check_interval_batches: int | None = None,
         max_train_batches_per_epoch: int | None = 128,
         finetuning_subset_frac: float | None = None,
@@ -2674,7 +2759,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         early_stopping_mode: str = "auto",
         patience_epochs: int = 50,
         patience_checks: int | None = None,
-        val_checks_per_epoch_target: int = 4,
+        val_checks_per_epoch_target: int | Literal["auto"] = "auto",
         val_check_interval_batches: int | None = None,
         max_train_batches_per_epoch: int | None = 128,
         finetuning_subset_frac: float | None = None,
