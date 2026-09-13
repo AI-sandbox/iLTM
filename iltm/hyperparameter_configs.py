@@ -56,7 +56,7 @@ def _with_checkpoint_mix(config):
     return mixed
 
 
-_ESTABLISHED_SINGLE_CONFIGS = (
+_PORTFOLIO_UNMIXED_CONFIGS = (
     _tree_config(
         checkpoint="xgbrconcat",
         n_ensemble=12,
@@ -175,7 +175,9 @@ _ESTABLISHED_SINGLE_CONFIGS = (
     ),
 )
 
-_CAMPAIGN_CONFIGS = (
+_PORTFOLIO_CONFIGS = (
+    *_PORTFOLIO_UNMIXED_CONFIGS,
+    *(_with_checkpoint_mix(config) for config in _PORTFOLIO_UNMIXED_CONFIGS),
     _with_checkpoint_mix(
         _tree_config(
             checkpoint="cbrconcat",
@@ -438,9 +440,7 @@ _CAMPAIGN_CONFIGS = (
 
 
 def get_hyperparameter_configs():
-    singles = deepcopy(_ESTABLISHED_SINGLE_CONFIGS)
-    mixed_twins = tuple(_with_checkpoint_mix(config) for config in singles)
-    return list(singles + mixed_twins + deepcopy(_CAMPAIGN_CONFIGS))
+    return deepcopy(list(_PORTFOLIO_CONFIGS))
 
 
 __all__ = ["get_hyperparameter_configs"]

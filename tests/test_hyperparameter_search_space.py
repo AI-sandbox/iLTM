@@ -60,7 +60,7 @@ class TestHyperparameterConfigs:
         assert all("name" not in config for config in configs)
         assert len({json.dumps(config, sort_keys=True) for config in configs}) == 25
 
-    def test_portfolio_contains_established_singles_and_mixed_twins(self):
+    def test_portfolio_pairs_unmixed_configs_with_checkpoint_mix_twins(self):
         configs = get_hyperparameter_configs()
 
         for single, mixed in zip(configs[:6], configs[6:12], strict=True):

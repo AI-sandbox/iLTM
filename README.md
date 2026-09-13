@@ -96,30 +96,12 @@ Classifier only:
 
 ## Hyperparameter Optimization
 
-iLTM performs best when you tune its hyperparameters.
-
-### Recommended search space
-
-The package exposes a recommended search space via `iltm.get_hyperparameter_search_space`, a plain dictionary that maps hyperparameter names to small specs.
+iLTM performs best when you go beyond the default hyperparameters. We recommend using the 25-config portfolio with `iltm.get_hyperparameter_configs()`.
 
 > [!TIP]
 > When running hyperparameter optimization with time constraints, you can use the `fit_max_time` parameter in `fit()` to limit training time per configuration. The model will return a partial ensemble if the time limit is reached. 
 
-The checkpoint parameter is part of this space. It is responsible for selecting one of the built in model checkpoints, which in turn sets other fields such as `preprocessing`, `tree_embedding`, and others.
-
-The specification format is intentionally minimal so that it can be re-used in any hyperparameter optimization library or custom tuning procedure.
-
-
-- `iltm.get_hyperparameter_search_space()` gives you the canonical space definition.
-- `iltm.sample_hyperparameters(rng)` draws a single random configuration from that space for quick baselines and smoke tests.
-
-> [!TIP]
-> `sample_hyperparameters` is mainly intended for quick baselines, smoke
-> tests, or simple random search. For more serious tuning runs it is
-> usually better to adapt the search space from
-> `get_hyperparameter_search_space` into your optimization method of
-> choice, and let that method decide which configurations to try.
-
+Use the recommended search space if you want to explore further. `iltm.get_hyperparameter_search_space` returns a plain dictionary that maps hyperparameter names to small specs. The checkpoint is part of this space. It selects one of the built-in model checkpoints, which in turn sets other fields such as `preprocessing`, `tree_embedding`, and others.
 
 ## Development
 
