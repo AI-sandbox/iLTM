@@ -528,8 +528,10 @@ class TreeEmbedding:
                 catboost_params['task_type'] = 'CPU'
                 catboost_params.pop('devices', None)
 
-            # Cap GPU memory use fraction based on what is currently free
+            # Return inactive PyTorch allocations before CatBoost sizes its pool.
             if catboost_params['task_type'] == 'GPU':
+                gc.collect()
+                clear_cuda_cache()
                 catboost_params['gpu_ram_part'] = pick_gpu_ram_part(self.device)
                 info = get_gpu_memory_info(self.device)
                 if info and info["free_mb"] < 2048:

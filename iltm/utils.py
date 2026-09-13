@@ -1641,15 +1641,8 @@ def get_gpu_memory_info(device: torch.device | str | None = None) -> dict | None
 def pick_gpu_ram_part(device: torch.device | str | None = None,
                       cap: float = 0.95,
                       floor: float = 0.30) -> float:
-    """
-    For CatBoost: returns a safe gpu_ram_part in [floor, cap].
-    Approximates 90% of the currently free fraction of total VRAM, capped in [floor, cap].
-    """
-    info = get_gpu_memory_info(device)
-    if info is None:
-        return cap
-    frac_free_of_total = info["free_mb"] / max(1.0, info["total_mb"])
-    return max(floor, min(cap, frac_free_of_total * 0.9))
+    """Return CatBoost's fraction of free GPU memory, respecting cap/floor."""
+    return max(floor, min(cap, 0.9))
 
 
 def is_cuda_oom(err: BaseException) -> bool:
