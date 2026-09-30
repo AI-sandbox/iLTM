@@ -648,13 +648,18 @@ class TreeEmbedding:
         elif self.tree_model in ['XGBoost_approx', 'XGBoost_hist']:
             # Clean infs and values too large (crashes)
             X = self._handle_inf_and_value_too_large(X)
+            n_rows = len(X)
+            padding_rows = (-n_rows) % 128
+            if self._is_gpu_device() and padding_rows:
+                # Fill the final GPU block so XGBoost initializes every missing-value slot.
+                X = pd.concat([X, X.iloc[[0] * padding_rows]], ignore_index=True)
             dtest = xgb.DMatrix(X, enable_categorical=True)
             predict_kwargs = {}
             if self.select_best_model:
                 best_iteration = getattr(self.model, 'best_iteration', None)
                 if best_iteration is not None:
                     predict_kwargs['iteration_range'] = (0, int(best_iteration) + 1)
-            emb = self.model.predict(dtest, pred_leaf=True, **predict_kwargs)
+            emb = self.model.predict(dtest, pred_leaf=True, **predict_kwargs)[:n_rows]
 
         elif self.tree_model == 'CatBoost':
             X = preprocess_cat_features_for_catboost(X, self.cat_features)
