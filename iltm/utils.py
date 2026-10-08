@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import math
 import time
@@ -668,6 +670,16 @@ class Lion(torch.optim.Optimizer):
                 m.mul_(b2).add_(g, alpha=1-b2)
 
 
+class _BatchedTensorDataset(TensorDataset):
+    def __getitems__(self, indices):
+        indices = torch.as_tensor(indices, dtype=torch.long)
+        return tuple(tensor[indices] for tensor in self.tensors)
+
+
+def _keep_tensor_batch(batch):
+    return batch
+
+
 def fine_tune_main_network(
     cfg, X, y, n_classes,
     rf, pca, main_network, norm,
@@ -743,9 +755,10 @@ def fine_tune_main_network(
     avg_step_time = None
 
     def _evaluate_validation_metric():
-        val_loss = 0
+        batch_losses = []
         val_targets = []
         val_outputs = []
+        collect_predictions = n_classes == 1 or val_metric_name == "AUC"
         with torch.no_grad():
             for inputs, targets in val_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
@@ -758,9 +771,16 @@ def fine_tune_main_network(
                     if n_classes == 1:
                         raise ValueError(f"Shape mismatch between outputs and targets: outputs {outputs.shape}, targets {targets.shape}")
                 loss = criterion(outputs, targets)
-                val_loss += loss.item()
-                val_targets.append(targets)
-                val_outputs.append(outputs)
+                batch_losses.append(loss)
+                if collect_predictions:
+                    val_targets.append(targets)
+                    val_outputs.append(outputs)
+
+        val_loss = 0
+        for batch_loss in torch.stack(batch_losses).cpu().tolist():
+            val_loss += batch_loss
+        if not collect_predictions:
+            return val_loss, val_loss
 
         val_targets = torch.cat(val_targets)
         val_outputs = torch.cat(val_outputs)
@@ -861,15 +881,17 @@ def fine_tune_main_network(
     def build_epoch_loaders(X_train_full, y_train_full):
         idx = make_train_indices_epoch(len(X_train_full))
         train_dataset = Subset(
-            TensorDataset(X_train_full, y_train_full, train_ids),
+            _BatchedTensorDataset(X_train_full, y_train_full, train_ids),
             idx,
         )
         # Only use pin_memory for CUDA devices to avoid deprecation warnings on CPU
         use_pin_memory = device.type == 'cuda'
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_pin_memory)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_pin_memory,
+                                  collate_fn=_keep_tensor_batch)
         if X_val is not None and y_val is not None:
-            val_dataset = TensorDataset(X_val, y_val)
-            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=use_pin_memory)
+            val_dataset = _BatchedTensorDataset(X_val, y_val)
+            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=use_pin_memory,
+                                   collate_fn=_keep_tensor_batch)
         else:
             val_loader = None
         return train_loader, val_loader, len(idx)
@@ -1252,15 +1274,14 @@ def check_stratification(y, stratify, task_type):
 
 
 def standardize_column_dtypes(df: pd.DataFrame) -> pd.DataFrame:
-    for column in df.columns:
-        column_dtype = df[column].dtype
+    for column, column_dtype in df.dtypes.items():
         if not (
             pd.api.types.is_numeric_dtype(column_dtype)
             or pd.api.types.is_bool_dtype(column_dtype)
         ) and df[column].apply(type).nunique() > 1:
             df[column] = df[column].astype(str)
         # bool to category
-        if df[column].dtype == 'bool':
+        if column_dtype == 'bool':
             df[column] = df[column].astype('category')
 
     return df

@@ -1354,7 +1354,6 @@ class _iLTMBase(BaseEstimator):
                     predictor[key][i] = layer.to(target)
             elif isinstance(predictor[key], (nn.Module, nn.Sequential)):
                 predictor[key] = predictor[key].to(target)
-        gc.collect()
         return predictor
 
     def _move_predictor_to_cpu(self, predictor: dict) -> dict:
@@ -1369,7 +1368,6 @@ class _iLTMBase(BaseEstimator):
                     predictor[key][i] = layer.to("cpu")
             elif isinstance(predictor[key], (nn.Module, nn.Sequential)):
                 predictor[key] = predictor[key].to("cpu")
-        gc.collect()
         return predictor
 
     # -----------------------------
@@ -1530,6 +1528,7 @@ class _iLTMBase(BaseEstimator):
         *,
         manage_predictor_device: bool = True,
         return_retrieval_components: bool = False,
+        retrieval_context_cache: dict[str, tuple[Tensor, Tensor]] | None = None,
     ) -> Tensor | tuple[Tensor, Tensor]:
         if manage_predictor_device:
             try:
@@ -1543,6 +1542,7 @@ class _iLTMBase(BaseEstimator):
                     n_outputs,
                     manage_predictor_device=False,
                     return_retrieval_components=return_retrieval_components,
+                    retrieval_context_cache=retrieval_context_cache,
                 )
             finally:
                 self._move_predictor_to_cpu(predictor)
@@ -1581,8 +1581,12 @@ class _iLTMBase(BaseEstimator):
             if X_ctxt_superset_concat is not None:
                 X_ctxt_superset_concat = X_ctxt_superset_concat[:, feature_bagging_idxs]
 
-        prepared_retrieval_context = None
-        if do_retrieval:
+        prepared_retrieval_context = (
+            retrieval_context_cache.get("context")
+            if retrieval_context_cache is not None
+            else None
+        )
+        if do_retrieval and prepared_retrieval_context is None:
             prepared_retrieval_context = prepare_retrieval_context(
                 X_ctxt_superset_concat,
                 y_ctxt_superset,
@@ -1596,17 +1600,19 @@ class _iLTMBase(BaseEstimator):
                 False,
                 batch_size=self.batch_size,
             )
+            if retrieval_context_cache is not None:
+                retrieval_context_cache["context"] = prepared_retrieval_context
 
-        ds = torch.utils.data.TensorDataset(X_concat)
         bs = int(self.batch_size)
         outs = []
         retrieval_outs = []
 
         while True:
             try:
-                loader = torch.utils.data.DataLoader(ds, batch_size=bs, shuffle=False)
-                for (Xb,) in loader:
-                    Xb = Xb.to(self.device)
+                # Match the seed consumed by DataLoader's iterator, including retries.
+                torch.empty((), dtype=torch.int64).random_().item()
+                for start in range(0, len(X_concat), bs):
+                    Xb = X_concat[start : start + bs].contiguous().to(self.device)
                     model_cfg = self._get_inference_model_config()
                     out = full_main_forward(
                         Xb,
@@ -2226,6 +2232,7 @@ class _iLTMBase(BaseEstimator):
 
                 outs_chunks: List[Tensor] = []
                 retrieval_outs_chunks: List[Tensor] = []
+                retrieval_context_cache: dict[str, tuple[Tensor, Tensor]] = {}
                 try:
                     predictor = self._move_predictor_to_device(
                         predictor,
@@ -2256,6 +2263,7 @@ class _iLTMBase(BaseEstimator):
                             n_outputs=n_outputs,
                             manage_predictor_device=False,
                             return_retrieval_components=return_retrieval_components,
+                            retrieval_context_cache=retrieval_context_cache,
                         )
                         if return_retrieval_components:
                             main_out, retrieval_out = out
@@ -2266,6 +2274,7 @@ class _iLTMBase(BaseEstimator):
                                 out = F.softmax(out, dim=1)
                             outs_chunks.append(out)
                 finally:
+                    retrieval_context_cache.clear()
                     self._move_predictor_to_cpu(predictor)
 
                 outputs = torch.cat(outs_chunks, dim=0)
@@ -3005,6 +3014,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
                     except Exception:
                         chunk_rows = 10000
                     pred_labels_chunks: List[Tensor] = []
+                    retrieval_context_cache: dict[str, tuple[Tensor, Tensor]] = {}
                     try:
                         predictor = self._move_predictor_to_device(
                             predictor,
@@ -3030,9 +3040,11 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
                                 X_tensor,
                                 n_outputs=self.n_outputs_,
                                 manage_predictor_device=False,
+                                retrieval_context_cache=retrieval_context_cache,
                             )
                             pred_labels_chunks.append(torch.argmax(logits, dim=1))
                     finally:
+                        retrieval_context_cache.clear()
                         self._move_predictor_to_cpu(predictor)
                     pred_labels = torch.cat(pred_labels_chunks, dim=0)
                 else:
