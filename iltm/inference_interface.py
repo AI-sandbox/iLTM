@@ -6,6 +6,7 @@ import math
 import logging
 from typing import List, Tuple, Optional, Dict, Any, Literal
 import time
+import zipfile
 
 import requests
 import numpy as np
@@ -847,16 +848,26 @@ class _iLTMBase(BaseEstimator):
             pca_fit=self.pca_fit,
             pca_svd_driver=self.pca_svd_driver,
             hyper_dropout=self.hyper_dropout,
-            pca_sampling=self.pca_sampling
-        ).to(self.device)
+            pca_sampling=self.pca_sampling,
+        )
 
         state_dict: Dict[str, Any] = {}
 
         path_exists = bool(self.model_path) and os.path.exists(self.model_path)  # type: ignore[arg-type]
         if path_exists:
             logger.info(f"Loading model from {self.model_path} on {self.device} device...")
+            load_options: Dict[str, Any] = {"map_location": torch.device(self.device)}
+            use_mmap = self.device.type == "cuda" and zipfile.is_zipfile(self.model_path)
+            if use_mmap:
+                load_options["mmap"] = True
             try:
-                state_dict = torch.load(self.model_path, map_location=torch.device(self.device), weights_only=True)  # type: ignore[arg-type]
+                try:
+                    state_dict = torch.load(self.model_path, weights_only=True, **load_options)  # type: ignore[arg-type]
+                except (OSError, RuntimeError) as e:
+                    if not use_mmap or (isinstance(e, RuntimeError) and "mmap" not in str(e).lower()):
+                        raise
+                    # Some filesystems cannot map checkpoint files.
+                    state_dict = torch.load(self.model_path, map_location=torch.device(self.device), weights_only=True)  # type: ignore[arg-type]
             except TypeError:
                 state_dict = torch.load(self.model_path, map_location=torch.device(self.device))  # type: ignore[arg-type]
         else:
@@ -879,12 +890,50 @@ class _iLTMBase(BaseEstimator):
 
         if len(modified_state_dict) > 0:
             try:
-                model.load_state_dict(modified_state_dict)
+                model_state = model.state_dict()
+                expected_device = self.device
+                if expected_device.type == "cuda" and expected_device.index is None:
+                    expected_device = torch.device("cuda", torch.cuda.current_device())
+                can_assign = modified_state_dict.keys() == model_state.keys() and all(
+                    type(value) in (Tensor, nn.Parameter)
+                    and value.shape == model_state[key].shape
+                    and value.dtype == model_state[key].dtype
+                    and value.layout == model_state[key].layout
+                    and value.stride() == model_state[key].stride()
+                    and not model_state[key].is_meta
+                    and value.device.type == expected_device.type
+                    and (expected_device.type != "cuda" or value.device.index == expected_device.index)
+                    and value.storage_offset() == model_state[key].storage_offset()
+                    and value.untyped_storage().nbytes() == model_state[key].untyped_storage().nbytes()
+                    for key, value in modified_state_dict.items()
+                )
+                if can_assign:
+                    model_storage_groups = {}
+                    checkpoint_storage_groups = {}
+                    for key, value in modified_state_dict.items():
+                        model_storage = model_state[key].untyped_storage()
+                        checkpoint_storage = value.untyped_storage()
+                        model_group = (model_storage.data_ptr(), model_storage.nbytes())
+                        checkpoint_group = (checkpoint_storage.data_ptr(), checkpoint_storage.nbytes())
+                        if (
+                            model_storage_groups.setdefault(model_group, checkpoint_group) != checkpoint_group
+                            or checkpoint_storage_groups.setdefault(checkpoint_group, model_group) != model_group
+                        ):
+                            can_assign = False
+                            break
+                if can_assign:
+                    # Keep constructor RNG draws; replace weights before device transfer.
+                    model.load_state_dict(modified_state_dict, assign=True)
+                else:
+                    model.to(self.device)
+                    model.load_state_dict(modified_state_dict)
                 logger.info(f"Model loaded from {self.model_path} on {self.device} device.")
             except FileNotFoundError as e:
                 raise FileNotFoundError(f"Model file not found at {self.model_path}") from e
             except RuntimeError as e:
                 raise RuntimeError(f"Failed to load the model from {self.model_path}") from e
+        else:
+            model.to(self.device)
 
         model.eval()
         self._model_cache[cache_key] = model
@@ -1862,9 +1911,21 @@ class _iLTMBase(BaseEstimator):
             X_tree, y_tree, X_for_nn, y_for_nn = self._split_data_tree_embedding(
                 X_original, y_proc, random_state=self.seed
             )
-            self.tr_.fit_tree(X_tree, y_tree, eval_set=tree_eval_set, concat_with_orig_features=self.concat_tree_with_orig_features)  # type: ignore[union-attr]
-
-            X_emb_train = self.tr_.transform(X_for_nn)  # type: ignore[union-attr]
+            if X_tree is X_for_nn and hasattr(self.tr_, "_fit_transform_training"):
+                X_emb_train = self.tr_._fit_transform_training(  # type: ignore[union-attr]
+                    X_tree,
+                    y_tree,
+                    eval_set=tree_eval_set,
+                    concat_with_orig_features=self.concat_tree_with_orig_features,
+                )
+            else:
+                self.tr_.fit_tree(
+                    X_tree,
+                    y_tree,
+                    eval_set=tree_eval_set,
+                    concat_with_orig_features=self.concat_tree_with_orig_features,
+                )  # type: ignore[union-attr]
+                X_emb_train = self.tr_.transform(X_for_nn)  # type: ignore[union-attr]
             X_emb_val = None
             if X_val_original is not None:
                 X_emb_val = self.tr_.transform(X_val_original)  # type: ignore[union-attr]
@@ -2021,14 +2082,21 @@ class _iLTMBase(BaseEstimator):
                     X_tree, y_tree, X_for_nn, y_for_nn = self._split_data_tree_embedding(
                         X_original, y_proc, random_state=self.seed + i
                     )
-                    tree.fit_tree(
-                        X_tree,
-                        y_tree,
-                        eval_set=tree_eval_set,
-                        concat_with_orig_features=predictor_concat,
-                    )
-
-                    X_emb_tr = tree.transform(X_for_nn)
+                    if X_tree is X_for_nn and hasattr(tree, "_fit_transform_training"):
+                        X_emb_tr = tree._fit_transform_training(
+                            X_tree,
+                            y_tree,
+                            eval_set=tree_eval_set,
+                            concat_with_orig_features=predictor_concat,
+                        )
+                    else:
+                        tree.fit_tree(
+                            X_tree,
+                            y_tree,
+                            eval_set=tree_eval_set,
+                            concat_with_orig_features=predictor_concat,
+                        )
+                        X_emb_tr = tree.transform(X_for_nn)
                     X_emb_val = tree.transform(X_val_original) if X_val_original is not None else None
 
                     if predictor_concat:

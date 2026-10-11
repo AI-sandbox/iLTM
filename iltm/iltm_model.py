@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import time
 import math
@@ -5,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .utils import forward_linear_layer, TorchPCA, SimpleBatchNorm1dFixed
+from .utils import forward_linear_layer, Linear, TorchPCA, SimpleBatchNorm1dFixed
 
 logger = logging.getLogger(__name__)
 
@@ -251,8 +253,9 @@ class HypernetworkBlock(nn.Module):
         
         perclass_mean = []
         for lab in range(n_classes):
-            if torch.sum((y == lab)) > 0:
-                class_mean = torch.mean(X[y == lab], dim=0, keepdim=True)
+            class_rows = X[y == lab]
+            if class_rows.shape[0]:
+                class_mean = torch.mean(class_rows, dim=0, keepdim=True)
             else:
                 class_mean = torch.mean(X, dim=0, keepdim=True)
             perclass_mean.append(class_mean)
@@ -334,9 +337,11 @@ class HypernetworkBlock(nn.Module):
             weights = []
             last_input_mean = []
             for lab in range(n_classes):
-                if torch.sum((y == lab)) > 0:
-                    class_weights = torch.mean(weights_per_sample[y == lab], dim=0, keepdim=True)
-                    class_input_mean = torch.mean(out[y == lab], dim=0, keepdim=True)
+                class_mask = y == lab
+                class_weights_rows = weights_per_sample[class_mask]
+                if class_weights_rows.shape[0]:
+                    class_weights = torch.mean(class_weights_rows, dim=0, keepdim=True)
+                    class_input_mean = torch.mean(out[class_mask], dim=0, keepdim=True)
                 else:
                     class_weights = torch.mean(weights_per_sample, dim=0, keepdim=True)
                     class_input_mean = torch.mean(out, dim=0, keepdim=True)
@@ -351,12 +356,8 @@ class HypernetworkBlock(nn.Module):
             weights[:, :-1] = weights[:, :-1] + last_input_mean
             weights = weights.transpose(0, 1)
 
-        # Apply the final transformed weights to the output
-        out, last_layer = forward_linear_layer(out, weights, n_classes)
-
-        return last_layer
-    
-    
+        weights = weights.view(-1, n_classes)
+        return Linear(weights[:-1, :], weights[-1, :])
 
     def get_main_weights(self, x, hn, weight_gen=None):
         emb = hn(x)

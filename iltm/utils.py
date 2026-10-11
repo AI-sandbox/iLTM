@@ -150,15 +150,16 @@ def sample_data(X: Tensor | dict, y: Tensor,
         raise ValueError("to_meta_model must be False when returning sampled indices.")
     # For regression, stratification is not applicable; always use random sampling:
     sampled_indices = torch.randperm(len(y))[:batch_size]
+    selection_indices = sampled_indices.to(y.device)
 
     if isinstance(X, dict):
         X_sampled = {
-            'x_num': X['x_num'][sampled_indices],
-            'x_cat': X['x_cat'][sampled_indices]
+            "x_num": X["x_num"].index_select(0, selection_indices.to(X["x_num"].device)),
+            "x_cat": X["x_cat"].index_select(0, selection_indices.to(X["x_cat"].device)),
         }
     else:
-        X_sampled = X[sampled_indices]
-    y_sampled = y[sampled_indices]
+        X_sampled = X.index_select(0, selection_indices.to(X.device))
+    y_sampled = y.index_select(0, selection_indices)
 
     if return_rest:
         assert not return_sampled_indices
@@ -673,11 +674,44 @@ class Lion(torch.optim.Optimizer):
 class _BatchedTensorDataset(TensorDataset):
     def __getitems__(self, indices):
         indices = torch.as_tensor(indices, dtype=torch.long)
-        return tuple(tensor[indices] for tensor in self.tensors)
+        indices = torch.where(indices < 0, indices + len(self), indices)
+        return tuple(tensor.index_select(0, indices.to(tensor.device)) for tensor in self.tensors)
+
+
+class _BatchedTensorSubset(Subset):
+    def __getitems__(self, indices):
+        indices = torch.as_tensor(indices, dtype=torch.long)
+        return self.dataset.__getitems__(self.indices[indices])
 
 
 def _keep_tensor_batch(batch):
     return batch
+
+
+def _move_tensor_batch(tensors, device):
+    if device.type == "cuda" and all(tensor.is_pinned() for tensor in tensors):
+        batch = tuple(tensor.to(device, non_blocking=True) for tensor in tensors)
+        torch.cuda.current_stream(device).synchronize()
+        return batch
+    return tuple(tensor.to(device) for tensor in tensors)
+
+
+def _gather_tensor_batch(tensors, indices, device):
+    indices = indices.to(device, non_blocking=indices.is_pinned())
+    batch = tuple(tensor.index_select(0, indices) for tensor in tensors)
+    if device.type == "cuda":
+        torch.cuda.current_stream(device).synchronize()
+    return batch
+
+
+def _clip_grad_norm(parameters, max_norm):
+    parameters = list(parameters)
+    total_norm = torch.nn.utils.get_total_norm(
+        [parameter.grad for parameter in parameters if parameter.grad is not None],
+        foreach=False,
+    )
+    torch.nn.utils.clip_grads_with_norm_(parameters, max_norm, total_norm)
+    return total_norm
 
 
 def fine_tune_main_network(
@@ -761,7 +795,7 @@ def fine_tune_main_network(
         collect_predictions = n_classes == 1 or val_metric_name == "AUC"
         with torch.no_grad():
             for inputs, targets in val_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
+                inputs, targets = _move_tensor_batch((inputs, targets), device)
 
                 outputs = main_model(inputs, X_ctxt_superset, y_ctxt_superset, training=False)
 
@@ -878,10 +912,17 @@ def fine_tune_main_network(
         return torch.randperm(len_train)[:n_target]
 
     # Utility to create loaders for this epoch
+    train_context_positions = None
+
     def build_epoch_loaders(X_train_full, y_train_full):
         idx = make_train_indices_epoch(len(X_train_full))
-        train_dataset = Subset(
-            _BatchedTensorDataset(X_train_full, y_train_full, train_ids),
+        tensors = (
+            (train_context_positions,)
+            if train_context_positions is not None
+            else (X_train_full, y_train_full, train_ids)
+        )
+        train_dataset = _BatchedTensorSubset(
+            _BatchedTensorDataset(*tensors),
             idx,
         )
         # Only use pin_memory for CUDA devices to avoid deprecation warnings on CPU
@@ -980,6 +1021,8 @@ def fine_tune_main_network(
             X_ctxt_superset = X_train.to(device)
             y_ctxt_superset = y_train.to(device)
             context_ids_superset = train_ids.to(device)
+            if device.type == "cuda" and X_train.device.type == y_train.device.type == "cpu":
+                train_context_positions = torch.arange(len(X_train), device="cpu")
     else:
         X_ctxt_superset = None
         y_ctxt_superset = None
@@ -1148,7 +1191,8 @@ def fine_tune_main_network(
                     )
 
         batches_run_this_epoch = 0
-        for it, (inputs, targets, query_ids) in enumerate(train_loader):
+        for it, batch in enumerate(train_loader):
+            inputs, targets, query_ids = batch if train_context_positions is None else (None, None, None)
             # before starting a new step, check deadline using the running average
             if fit_deadline is not None and avg_step_time:
                 remaining = fit_deadline - time.time()
@@ -1158,9 +1202,15 @@ def fine_tune_main_network(
                     logger.warning("Early return: finetuning budget nearly exhausted.")
                     break
 
-            step_t0 = time.time()                 # NEW
+            step_t0 = time.time()  # NEW
 
-            inputs, targets, query_ids = inputs.to(device), targets.to(device), query_ids.to(device)
+            if train_context_positions is not None:
+                inputs, targets, query_ids = _gather_tensor_batch(
+                    (X_ctxt_superset, y_ctxt_superset, context_ids_superset), batch[0], device
+                )
+            else:
+                inputs, targets, query_ids = _move_tensor_batch(batch, device)
+            del batch
             optimizer.zero_grad()
             with torch.amp.autocast(device.type, enabled=(use_amp_finetuning and device.type == 'cuda')):
                 forward_kwargs = {"training": True}
@@ -1181,7 +1231,7 @@ def fine_tune_main_network(
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(main_model.parameters(), gradient_clip_norm, foreach=False)
+            _clip_grad_norm(main_model.parameters(), gradient_clip_norm)
             scaler.step(optimizer)
             scaler.update()
 

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import gc
 import warnings
@@ -752,6 +754,37 @@ class TreeEmbedding:
             X (pd.DataFrame | np.ndarray): Input features for model training.
             y (np.ndarray): Target variable for model training.
         """
+        self._fit_tree(X, y, eval_set, concat_with_orig_features)
+
+    def _fit_transform_training(
+        self,
+        X: pd.DataFrame | np.ndarray,
+        y: np.ndarray,
+        eval_set: tuple = None,
+        concat_with_orig_features: bool = True,
+    ) -> np.ndarray:
+        if (
+            getattr(self.fit_tree, "__func__", None) is not _TREE_EMBEDDING_FIT_TREE
+            or getattr(self.transform, "__func__", None) is not _TREE_EMBEDDING_TRANSFORM
+        ):
+            self.fit_tree(
+                X,
+                y,
+                eval_set=eval_set,
+                concat_with_orig_features=concat_with_orig_features,
+            )
+            return self.transform(X)
+        embeddings = self._fit_tree(X, y, eval_set, concat_with_orig_features)
+        return self._encode_embeddings(embeddings)
+
+    def _fit_tree(
+        self,
+        X: pd.DataFrame | np.ndarray,
+        y: np.ndarray,
+        eval_set: tuple = None,
+        concat_with_orig_features: bool = True,
+    ) -> np.ndarray:
+        """Fit the tree and encoder, returning the training leaf matrix."""
         logger.info(f"Fitting tree model: {self.tree_model}")
         self.n_orig_features_to_keep_ = None
         self.orig_feature_indices_to_keep_ = None
@@ -810,9 +843,9 @@ class TreeEmbedding:
                         > _DENSE_ONEHOT_WORKING_SET_BYTES
                     )
                 )
-                emb_oh = self.onehot_encoder.transform(emb)
-                # identify top features
-                feature_counts = np.asarray(emb_oh.sum(axis=0)).ravel()
+                feature_counts = np.concatenate(
+                    [np.unique(emb[:, index], return_counts=True)[1] for index in range(emb.shape[1])]
+                )
                 # Sort features by frequency and get their indices
                 sorted_feature_indices = np.argsort(feature_counts)[::-1]
 
@@ -820,6 +853,7 @@ class TreeEmbedding:
                 self.onehot_top_features_idx_ = sorted_feature_indices[:top_k_embeddings]
 
         logger.info(f"Tree model {self.tree_model} fitted successfully")
+        return emb
 
     def transform(self, X: pd.DataFrame | np.ndarray, onehot_encode: bool = True) -> np.ndarray:
         """
@@ -836,20 +870,21 @@ class TreeEmbedding:
         
         # Handle categorical features
         X_encoded = pd.DataFrame(X.copy())
-        orig_data_shape = X_encoded.shape
         X_encoded = self._handle_categorical_features(X_encoded, fit=False)
 
         # Get embeddings
         emb = self._get_embeddings(X_encoded)
-        orig_emb_shape = emb.shape
 
+        return self._encode_embeddings(emb, onehot_encode)
+
+    def _encode_embeddings(self, emb: np.ndarray, onehot_encode: bool = True) -> np.ndarray:
         if onehot_encode and self.tree_model != 'RT':
             # Transform embeddings using OneHotEncoder
             assert self.onehot_encoder is not None, "Model not fitted. Call fit_tree() first."
             logger.debug(f"One-hot transforming leaves: emb.shape={emb.shape}, dtype={emb.dtype}")
             emb_oh = self.onehot_encoder.transform(emb)
-            logger.debug(f"Original data shape: {orig_data_shape}, embedding shape: {orig_emb_shape}, after one-hot encoding: {emb_oh.shape}")
-            
+            logger.debug(f"Embedding shape: {emb.shape}, after one-hot encoding: {emb_oh.shape}")
+
             if self.onehot_max_features:
                 if self.onehot_top_features_idx_ is None:
                     raise Exception("onehot_max_features is True, but the top features were not identified. Make sure to call fit_tree first.")
@@ -860,7 +895,7 @@ class TreeEmbedding:
             
             return emb_oh
         else:
-            logger.debug(f"Original data shape: {orig_data_shape}, embedding shape: {orig_emb_shape} (no one-hot encoding applied)")
+            logger.debug(f"Embedding shape: {emb.shape} (no one-hot encoding applied)")
             return emb
 
     def get_tree_predictions(self, X: np.ndarray) -> np.ndarray:
@@ -896,3 +931,7 @@ class TreeEmbedding:
             return raw_preds.astype(float)
         else:
             return raw_preds.astype(int)
+
+
+_TREE_EMBEDDING_FIT_TREE = TreeEmbedding.fit_tree
+_TREE_EMBEDDING_TRANSFORM = TreeEmbedding.transform
