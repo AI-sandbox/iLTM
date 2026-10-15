@@ -178,7 +178,7 @@ class _iLTMBase(BaseEstimator):
         self,
         *,
         device: str = "cuda:0",
-        n_ensemble: int = 12,
+        n_ensemble: int = 8,
         batch_size: int = 4096,
         seed: int = 3,
         finetuning: bool = True,
@@ -2497,7 +2497,7 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
     def __init__(
         self,
         device: str = "cuda:0",
-        n_ensemble: int = 12,
+        n_ensemble: int = 8,
         batch_size: int = 4096,
         seed: int = 3,
         finetuning: bool = True,
@@ -2820,7 +2820,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
     def __init__(
         self,
         device: str = "cuda:0",
-        n_ensemble: int = 12,
+        n_ensemble: int = 8,
         batch_size: int = 4096,
         seed: int = 3,
         finetuning: bool = True,

@@ -13,6 +13,7 @@ class TestSklearnAPI:
     def test_finetuning_defaults(self, estimator_class):
         estimator = estimator_class(checkpoint=None, device="cpu")
 
+        assert estimator.n_ensemble == 8
         assert estimator.finetuning_batch_size == 2048
         assert estimator.max_train_batches_per_epoch == 128
         assert estimator.finetuning_subset_max_samples == 100_000
