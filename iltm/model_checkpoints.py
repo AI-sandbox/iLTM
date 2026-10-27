@@ -5,9 +5,63 @@ from typing import Dict, Any
 
 from huggingface_hub import hf_hub_download
 
+from .hyperparameter_configs import _CHECKPOINT_MIXES
+
 
 CKPT_DIR_ENV = "ILTM_CKPT_DIR"
 HF_REPO_ID = "dbonet/iLTM"
+AVAILABLE_CHECKPOINTS = [
+    "xgbrconcat", "cbrconcat", "r128bn", "rnobn", "xgb", "catb", "rtr", "rtrcb",
+]
+
+
+def resolve_checkpoint_mix(
+    checkpoint_mix: str | tuple[str, ...] | list[str] | None,
+) -> tuple[str, ...] | list[str] | None:
+    """Expand a named mix while accepting existing explicit checkpoint lists."""
+    if checkpoint_mix is None:
+        return None
+    if isinstance(checkpoint_mix, str):
+        if checkpoint_mix != "default":
+            raise ValueError(f"Unknown checkpoint_mix preset: {checkpoint_mix!r}.")
+        # The eight-member mix is the prefix of this recipe.
+        return tuple(_CHECKPOINT_MIXES[12])
+    if not isinstance(checkpoint_mix, (list, tuple)):
+        raise TypeError("checkpoint_mix must be a preset name, list, or tuple of checkpoints.")
+    if not checkpoint_mix:
+        raise ValueError("checkpoint_mix must contain at least one checkpoint.")
+    return checkpoint_mix
+
+
+def restrict_checkpoint_choices(
+    space: dict[str, dict[str, Any]], available_checkpoints: list[str] | None,
+) -> dict[str, dict[str, Any]]:
+    """Limit a space to supplied checkpoints, preserving explicit local paths."""
+    if available_checkpoints is None:
+        return space
+    checkpoints = list(available_checkpoints)
+    if not checkpoints:
+        raise ValueError("available_checkpoints must contain at least one checkpoint.")
+    space["checkpoint"] = {"type": "categorical", "choices": checkpoints}
+
+    by_family = {}
+    for checkpoint in checkpoints:
+        name = str(checkpoint).removesuffix(".pth")
+        for family in AVAILABLE_CHECKPOINTS:
+            if name.endswith(family):
+                by_family.setdefault(family, checkpoint)
+                break
+
+    recipe = resolve_checkpoint_mix("default")
+    if set(recipe) <= by_family.keys():
+        # Custom locations need an explicit recipe so every member uses the
+        # supplied file, even when the files live in different directories.
+        mix = tuple(by_family[name] for name in recipe)
+        choice = "default" if mix == recipe else mix
+        space["checkpoint_mix"] = {**space["checkpoint_mix"], "choices": [None, choice]}
+    else:
+        space["checkpoint_mix"] = {"type": "constant", "value": None}
+    return space
 
 
 def _get_platform_cache_dir() -> Path:
@@ -71,87 +125,86 @@ def _ensure_checkpoint(repo_id: str, filename: str, ckpt_dir: str) -> str:
         return path
 
 
+_CHECKPOINT_CONFIGS: Dict[str, Dict[str, Any]] = {
+    "r128bn": {
+        "preprocessing": "realmlp_td_s_v0",
+        "bottleneck_size": 128,
+        "tree_embedding": False,
+        "concat_tree_with_orig_features": False,
+    },
+    "rnobn": {
+        "preprocessing": "realmlp_td_s_v0",
+        "tree_embedding": False,
+        "concat_tree_with_orig_features": False,
+    },
+    "catb": {
+        "preprocessing": "none",
+        "tree_embedding": True,
+        "tree_model": "CatBoost",
+        "concat_tree_with_orig_features": False,
+    },
+    "xgb": {
+        "preprocessing": "none",
+        "tree_embedding": True,
+        "tree_model": "XGBoost_hist",
+        "concat_tree_with_orig_features": False,
+    },
+    "rtr": {
+        "preprocessing": "realmlp_td_s_v0",
+        "do_retrieval": True,
+        "tree_embedding": False,
+        "concat_tree_with_orig_features": False,
+    },
+    "rtrcb": {
+        "preprocessing": "none",
+        "tree_embedding": True,
+        "tree_model": "CatBoost",
+        "do_retrieval": True,
+        "concat_tree_with_orig_features": False,
+    },
+    "cbrconcat": {
+        "preprocessing": "realmlp_td_s_v0",
+        "tree_embedding": True,
+        "tree_model": "CatBoost",
+        "concat_tree_with_orig_features": True,
+    },
+    "xgbrconcat": {
+        "preprocessing": "realmlp_td_s_v0",
+        "tree_embedding": True,
+        "tree_model": "XGBoost_hist",
+        "concat_tree_with_orig_features": True,
+    },
+}
+
+
 def get_model_checkpoint_config(model_name_suffix: str) -> Dict[str, Any]:
-    ckpt_dir = _get_default_ckpt_dir()
-
-    registry: Dict[str, Dict[str, Any]] = {}
-    registry_configs = {
-        "r128bn": {
-            "preprocessing": "realmlp_td_s_v0",
-            "bottleneck_size": 128,
-            "tree_embedding": False,
-            "concat_tree_with_orig_features": False,
-        },
-        "rnobn": {
-            "preprocessing": "realmlp_td_s_v0",
-            "tree_embedding": False,
-            "concat_tree_with_orig_features": False,
-        },
-        "catb": {
-            "preprocessing": "none",
-            "tree_embedding": True,
-            "tree_model": "CatBoost",
-            "concat_tree_with_orig_features": False,
-        },
-        "xgb": {
-            "preprocessing": "none",
-            "tree_embedding": True,
-            "tree_model": "XGBoost_hist",
-            "concat_tree_with_orig_features": False,
-        },
-        "rtr": {
-            "preprocessing": "realmlp_td_s_v0",
-            "do_retrieval": True,
-            "tree_embedding": False,
-            "concat_tree_with_orig_features": False,
-        },
-        "rtrcb": {
-            "preprocessing": "none",
-            "tree_embedding": True,
-            "tree_model": "CatBoost",
-            "do_retrieval": True,
-            "concat_tree_with_orig_features": False,
-        },
-        "cbrconcat": {
-            "preprocessing": "realmlp_td_s_v0",
-            "tree_embedding": True,
-            "tree_model": "CatBoost",
-            "concat_tree_with_orig_features": True,
-        },
-        "xgbrconcat": {
-            "preprocessing": "realmlp_td_s_v0",
-            "tree_embedding": True,
-            "tree_model": "XGBoost_hist",
-            "concat_tree_with_orig_features": True,
-        },
-    }
-    for model_name, cfg in registry_configs.items():
-        registry[model_name] = {
-            "filename": f"{model_name}.pth",
-            **cfg,
-        }
-
-    for model_name, cfg in registry.items():
+    for model_name, config in _CHECKPOINT_CONFIGS.items():
         if model_name_suffix.endswith(model_name):
-            filename = cfg["filename"]
-            local_path = _ensure_checkpoint(HF_REPO_ID, filename, ckpt_dir)
-            out = {k: v for k, v in cfg.items() if k != "filename"}
-            out["checkpoint"] = local_path
-            return out
+            local_path = _ensure_checkpoint(
+                HF_REPO_ID, f"{model_name}.pth", _get_default_ckpt_dir(),
+            )
+            return {**config, "checkpoint": local_path}
 
-    available = list(registry.keys())
     raise ValueError(
-        f"Unknown model name suffix: {model_name_suffix}. Available models: {available}"
+        f"Unknown model name suffix: {model_name_suffix}. "
+        f"Available models: {list(_CHECKPOINT_CONFIGS)}"
     )
+
+
+def _local_checkpoint_config(checkpoint: str) -> Dict[str, Any]:
+    # A defined checkpoint keeps its identity when moved to another directory.
+    # Preserve the supplied path object for sklearn's constructor/clone contract.
+    config = _CHECKPOINT_CONFIGS.get(Path(checkpoint).stem, {})
+    return {**config, "checkpoint": checkpoint}
 
 
 def resolve_model_checkpoint(checkpoint: str) -> Dict[str, Any]:
     if os.path.isfile(checkpoint):
-        return {"checkpoint": checkpoint}
+        return _local_checkpoint_config(checkpoint)
 
     if os.path.isdir(checkpoint):
         pth_files = list(Path(checkpoint).glob("*.pth"))
         if pth_files:
-            return {"checkpoint": str(pth_files[0])}
+            return _local_checkpoint_config(str(pth_files[0]))
 
     return get_model_checkpoint_config(checkpoint)

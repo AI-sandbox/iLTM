@@ -8,7 +8,7 @@ import torch
 import copy
 import contextlib
 from collections import deque
-from typing import Tuple, Callable, Sequence
+from typing import Any, Tuple, Callable, Sequence
 import logging
 
 import torch.nn as nn
@@ -24,6 +24,21 @@ from sklearn.model_selection import train_test_split
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+
+def sample_from_spec(rng: np.random.Generator, spec: dict[str, Any]) -> Any:
+    kind = spec["type"]
+    if kind == "constant":
+        return copy.deepcopy(spec["value"])
+    if kind == "categorical":
+        index = rng.choice(len(spec["choices"]), p=spec.get("probs"))
+        value = copy.deepcopy(spec["choices"][index])
+        return value.item() if isinstance(value, np.generic) else value
+    if kind == "float_uniform":
+        return float(rng.uniform(spec["low"], spec["high"]))
+    if kind == "log_uniform":
+        return float(np.exp(rng.uniform(np.log(spec["low"]), np.log(spec["high"]))))
+    raise ValueError(f"Unknown hyperparameter type {kind!r}")
 
 
 def seed_everything(seed: int):

@@ -44,6 +44,34 @@ class TestCheckpointResolution:
             config = resolve_model_checkpoint(tmpdir)
             assert 'checkpoint' in config
             assert config['checkpoint'].endswith('.pth')
+
+    @pytest.mark.parametrize("name", [
+        "xgbrconcat", "cbrconcat", "r128bn", "rnobn", "xgb", "catb", "rtr", "rtrcb",
+    ])
+    @pytest.mark.parametrize("as_directory", [False, True])
+    def test_local_location_preserves_named_checkpoint_settings(
+        self, monkeypatch, tmp_path, name, as_directory,
+    ):
+        # The directory name must not override the identity in the filename.
+        directory = tmp_path / "cbrconcat" / "rtr"
+        directory.mkdir(parents=True)
+        path = directory / f"{name}.pth"
+        path.touch()
+        monkeypatch.setattr(
+            "iltm.model_checkpoints._ensure_checkpoint",
+            lambda *_args: str(path),
+        )
+        expected = get_model_checkpoint_config(name)
+
+        def fail_download(*_args, **_kwargs):
+            pytest.fail("Resolving an existing local file must not download weights")
+
+        monkeypatch.setattr("iltm.model_checkpoints._ensure_checkpoint", fail_download)
+        supplied_path = str(directory if as_directory else path)
+        actual = resolve_model_checkpoint(supplied_path)
+        assert actual == expected
+        if not as_directory:
+            assert actual["checkpoint"] is supplied_path
     
     def test_get_default_ckpt_dir(self):
         ckpt_dir = _get_default_ckpt_dir()

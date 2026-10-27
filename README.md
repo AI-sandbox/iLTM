@@ -72,7 +72,9 @@ Available checkpoint names:
 - `"rtr"`: Robust preprocessing with retrieval
 - `"rtrcb"`: CatBoost embeddings with retrieval
 
-You can also provide a local path to a checkpoint file.
+You can also provide a local path to a checkpoint file. Keep its defined filename
+(for example, `cbrconcat.pth`): iLTM uses that name to apply the same model settings
+regardless of which directory contains the file.
 
 Common key args:
 - checkpoint: checkpoint name or path to model file. Default "xgbrconcat".
@@ -101,7 +103,7 @@ iLTM performs best when you go beyond the default hyperparameters. We recommend 
 > [!TIP]
 > When running hyperparameter optimization with time constraints, you can use the `fit_max_time` parameter in `fit()` to limit training time per configuration. The model will return a partial ensemble if the time limit is reached. 
 
-Use the recommended search space if you want to explore further. `iltm.get_hyperparameter_search_space` returns a plain dictionary that maps hyperparameter names to small specs. The checkpoint is part of this space. It selects one of the built-in model checkpoints, which in turn sets other fields such as `preprocessing`, `tree_embedding`, and others.
+For random search, use `iltm.sample_hyperparameters(rng)` or obtain the search space with `iltm.get_hyperparameter_search_space()`.
 
 ## Development
 

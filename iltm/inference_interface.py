@@ -44,7 +44,7 @@ from iltm.utils import (
     detect_object_string_columns,
     robust_roc_auc_score,
 )
-from .model_checkpoints import resolve_model_checkpoint
+from .model_checkpoints import resolve_checkpoint_mix, resolve_model_checkpoint
 
 torch.set_float32_matmul_precision("high")  # enables TF32 on Ampere+
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -206,7 +206,7 @@ class _iLTMBase(BaseEstimator):
         gradient_clip_norm: float = 1.18,
         scheduler_min_lr: float = 6e-7,
         checkpoint: str | None = "xgbrconcat",
-        checkpoint_mix: tuple[str, ...] | list[str] | None = None,
+        checkpoint_mix: str | tuple[str, ...] | list[str] | None = None,
         stratify_sampling: bool = False,
         feature_bagging: bool = False,
         feature_bagging_size: int = 3000,
@@ -270,19 +270,20 @@ class _iLTMBase(BaseEstimator):
         cpu_memory_safety_margin_gb: float = 2.0,
         corr_select_k: int = 0,
         inference_storage_dtype: str | None = "float16",
+        corr_select_k_non_tree: int | None = None,
+        xgb_min_samples_leaf: int | None = None,
+        xgb_subsample: float | None = None,
+        xgb_feature_fraction: float | None = None,
+        finetuning_lr_adamw: float | None = None,
+        finetuning_lr_lion: float | None = None,
     ) -> None:
 
         # Logging
         self.logging_level = logging_level
         setup_logging(logging_level=self.logging_level)
 
-        if checkpoint_mix is not None:
-            if isinstance(checkpoint_mix, str) or not isinstance(checkpoint_mix, (list, tuple)):
-                raise TypeError("checkpoint_mix must be a list or tuple of checkpoints.")
-            if not checkpoint_mix:
-                raise ValueError("checkpoint_mix must contain at least one checkpoint.")
-
-        primary_checkpoint = checkpoint_mix[0] if checkpoint_mix else checkpoint
+        resolved_mix = resolve_checkpoint_mix(checkpoint_mix)
+        primary_checkpoint = resolved_mix[0] if resolved_mix else checkpoint
 
         # Resolve model checkpoint config if provided
         if primary_checkpoint is not None:
@@ -291,7 +292,10 @@ class _iLTMBase(BaseEstimator):
                 # Update parameters based on checkpoint configuration
                 for key, value in checkpoint_config.items():
                     if key == 'checkpoint':
-                        checkpoint = value
+                        # A mix may resolve its primary path again during clone.
+                        # Keep the supplied object when the path already matches.
+                        if checkpoint != value:
+                            checkpoint = value
                     elif key == 'preprocessing':
                         preprocessing = value
                     elif key == 'tree_embedding':
@@ -334,8 +338,8 @@ class _iLTMBase(BaseEstimator):
         self.finetuning_dropout = float(finetuning_dropout)
         self.finetuning_max_steps = int(finetuning_max_steps)
         self.finetuning_lr = float(finetuning_lr)
-        if scheduler_min_lr > self.finetuning_lr:
-            raise ValueError("scheduler_min_lr must be less than or equal to finetuning_lr.")
+        self.finetuning_lr_adamw = finetuning_lr_adamw
+        self.finetuning_lr_lion = finetuning_lr_lion
         self.finetuning_classification_val_metric = finetuning_classification_val_metric
         self.initial_transformations_finetuning = bool(initial_transformations_finetuning)
         self.early_stopping_mode = early_stopping_mode
@@ -363,6 +367,7 @@ class _iLTMBase(BaseEstimator):
         self.cooldown_checks = int(cooldown_checks)
         self.gradient_clip_norm = float(gradient_clip_norm)
         self.scheduler_min_lr = float(scheduler_min_lr)
+        self._resolve_finetuning_lr()
 
         self.checkpoint = checkpoint
         self.checkpoint_mix = checkpoint_mix
@@ -399,6 +404,11 @@ class _iLTMBase(BaseEstimator):
         self.tree_min_samples_leaf = tree_min_samples_leaf
         self.tree_subsample = tree_subsample
         self.tree_feature_fraction = tree_feature_fraction
+        # Keep raw overrides for sklearn cloning/set_params; resolve them when
+        # each predictor's tree is created (including mixed-checkpoint models).
+        self.xgb_min_samples_leaf = xgb_min_samples_leaf
+        self.xgb_subsample = xgb_subsample
+        self.xgb_feature_fraction = xgb_feature_fraction
         self.tree_data_split = tree_data_split
         self.tree_for_each_predictor = bool(tree_for_each_predictor)
         self.tree_use_default_params = bool(tree_use_default_params)
@@ -427,17 +437,17 @@ class _iLTMBase(BaseEstimator):
         self.retrieval_alpha_finetuning = bool(retrieval_alpha_finetuning)
         self.retrieval_temperature_finetuning = bool(retrieval_temperature_finetuning)
         self.retrieval_alpha_adaptive = bool(retrieval_alpha_adaptive)
-        if self.retrieval_alpha_adaptive and self.retrieval_alpha_finetuning:
+        if self.do_retrieval and self.retrieval_alpha_adaptive and self.retrieval_alpha_finetuning:
             raise ValueError(
                 "retrieval_alpha_adaptive and retrieval_alpha_finetuning cannot both be enabled."
             )
 
         self._checkpoint_mix_configs: List[dict[str, Any]] = []
-        if checkpoint_mix is not None:
+        if resolved_mix is not None:
             if not self.tree_for_each_predictor:
                 raise ValueError("checkpoint_mix requires tree_for_each_predictor=True.")
 
-            for mixed_checkpoint in checkpoint_mix:
+            for mixed_checkpoint in resolved_mix:
                 config = resolve_model_checkpoint(mixed_checkpoint)
                 mixed_config = {
                     "checkpoint": config["checkpoint"],
@@ -485,6 +495,7 @@ class _iLTMBase(BaseEstimator):
 
         # Correlation-based feature selection
         self.corr_select_k = int(corr_select_k)
+        self.corr_select_k_non_tree = corr_select_k_non_tree
         self.inference_storage_dtype = inference_storage_dtype
         self._inference_storage_torch_dtype = self._resolve_inference_storage_dtype(inference_storage_dtype)
 
@@ -498,6 +509,20 @@ class _iLTMBase(BaseEstimator):
         self.predictors_: List[dict] = []
         self.preprocessors_: List[dict] = []
         self.predictor_configs_: List[dict] = []
+
+    def _resolve_finetuning_lr(self) -> float:
+        """Resolve the active optimizer's override without changing public params."""
+        optimizer = self.finetuning_optimizer.lower()
+        override = (
+            getattr(self, f"finetuning_lr_{optimizer}", None)
+            if optimizer in {"adamw", "lion"} else None
+        )
+        rate = float(self.finetuning_lr if override is None else override)
+        if self.scheduler_min_lr > rate:
+            raise ValueError(
+                "scheduler_min_lr must be less than or equal to the effective finetuning_lr."
+            )
+        return rate
 
     @staticmethod
     def _resolve_inference_storage_dtype(dtype: str | torch.dtype | None) -> torch.dtype | None:
@@ -1070,7 +1095,8 @@ class _iLTMBase(BaseEstimator):
         x: np.ndarray | pd.DataFrame,
         y: np.ndarray | pd.Series,
         *,
-        is_classification: bool
+        is_classification: bool,
+        tree_embedding: bool | None = None,
     ) -> Tuple[np.ndarray, np.ndarray, dict]:
 
         logger.debug(f"Preprocessing x {np.shape(x)} with type: {self.preprocessing}")
@@ -1197,7 +1223,12 @@ class _iLTMBase(BaseEstimator):
         else:
             n_preprocessed_features = x.shape[1]
 
-        corr_select_k = min(self.corr_select_k, 20_000) if self.corr_select_k > 0 else 20_000
+        corr_select_k = self.corr_select_k
+        uses_tree_embedding = self.tree_embedding if tree_embedding is None else tree_embedding
+        non_tree_k = getattr(self, "corr_select_k_non_tree", None)
+        if not uses_tree_embedding and non_tree_k is not None:
+            corr_select_k = int(non_tree_k)
+        corr_select_k = min(corr_select_k, 20_000) if corr_select_k > 0 else 20_000
         if corr_select_k > 0 and n_preprocessed_features > corr_select_k:
             logger.debug(f"Applying target-based feature selection: selecting up to {corr_select_k} features")
             if self.preprocessing == 'realmlp_td_s_v0':
@@ -1434,6 +1465,7 @@ class _iLTMBase(BaseEstimator):
         fit_time_cushion_frac: float = 0.001,    # (0.1% headroom)
         val_checks_per_epoch_target: int = _AUTO_VAL_CHECKS_FULL,
     ) -> dict | None:
+        finetuning_lr = self._resolve_finetuning_lr() if self.finetuning else self.finetuning_lr
         X_pred, y_pred, feature_bagging_idxs = self._sample_data(X, y, pca_sampling=self.pca_sampling)
         X_pred, y_pred = (
             ({'x_num': X_pred['x_num'].to(self.device), 'x_cat': X_pred['x_cat'].to(self.device)} if isinstance(X_pred, dict) else X_pred.to(self.device)),
@@ -1473,7 +1505,7 @@ class _iLTMBase(BaseEstimator):
                         cfg=vars(self._model), X=X_, y=y, n_classes=n_outputs,
                         rf=rf, pca=pca, main_network=main_network, norm=norm,
                         device=self.device, max_epochs=self.finetuning_max_steps, batch_size=cur_bs,
-                        finetuning_optimizer=self.finetuning_optimizer, finetuning_lr=self.finetuning_lr, finetuning_data=self.finetuning_data,
+                        finetuning_optimizer=self.finetuning_optimizer, finetuning_lr=finetuning_lr, finetuning_data=self.finetuning_data,
                         finetuning_dropout=self.finetuning_dropout, X_val=X_val, y_val=y_val,
                         val_check_interval_batches=self.val_check_interval_batches,
                         do_retrieval=cur_retrieval, retrieval_alpha=self.retrieval_alpha,
@@ -1745,6 +1777,18 @@ class _iLTMBase(BaseEstimator):
         return X_tree, y_tree, X, y
 
     def _create_tree_embedding(self, *, tree_model: str, seed: int) -> TreeEmbedding:
+        # XGBoost overrides apply to the individual predictor's tree family.
+        # Other tree families retain their generic settings, including defaults.
+        min_samples_leaf = self.tree_min_samples_leaf
+        subsample = self.tree_subsample
+        feature_fraction = self.tree_feature_fraction
+        if tree_model in ("XGBoost", "XGBoost_hist", "XGBoost_approx"):
+            if getattr(self, "xgb_min_samples_leaf", None) is not None:
+                min_samples_leaf = self.xgb_min_samples_leaf
+            if getattr(self, "xgb_subsample", None) is not None:
+                subsample = self.xgb_subsample
+            if getattr(self, "xgb_feature_fraction", None) is not None:
+                feature_fraction = self.xgb_feature_fraction
         return TreeEmbedding(
             tree_model=tree_model,
             cat_features=self.cat_features,
@@ -1753,9 +1797,9 @@ class _iLTMBase(BaseEstimator):
             n_estimators=self.tree_n_estimators,
             lr=self.tree_lr,
             max_depth=self.tree_max_depth,
-            min_samples_leaf=self.tree_min_samples_leaf,
-            subsample=self.tree_subsample,
-            feature_fraction=self.tree_feature_fraction,
+            min_samples_leaf=min_samples_leaf,
+            subsample=subsample,
+            feature_fraction=feature_fraction,
             device=str(self.device) if hasattr(self.device, '__str__') else self.device,
             use_default_params=self.tree_use_default_params,
             select_best_model=self.tree_select_best_model,
@@ -2122,7 +2166,11 @@ class _iLTMBase(BaseEstimator):
                     y_for_nn = y_proc
                     X_val_fit = X_val_original
 
-                X_np, y_np, preproc = self._preprocess_fitting_data(X_fit, y_for_nn, is_classification=self.task_type == 'classification')
+                X_np, y_np, preproc = self._preprocess_fitting_data(
+                    X_fit, y_for_nn,
+                    is_classification=self.task_type == 'classification',
+                    tree_embedding=predictor_tree_embedding,
+                )
                 self.preprocessors_.append(preproc)
                 X_val_tensor = None
                 if X_val_fit is not None:
@@ -2524,7 +2572,7 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         gradient_clip_norm: float = 1.18,
         scheduler_min_lr: float = 6e-7,
         checkpoint: str | None = "xgbrconcat",
-        checkpoint_mix: tuple[str, ...] | list[str] | None = None,
+        checkpoint_mix: str | tuple[str, ...] | list[str] | None = None,
         stratify_sampling: bool = False,
         feature_bagging: bool = False,
         feature_bagging_size: int = 3000,
@@ -2588,6 +2636,12 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         cpu_memory_safety_margin_gb: float = 2.0,
         corr_select_k: int = 0,
         inference_storage_dtype: str | None = "float16",
+        corr_select_k_non_tree: int | None = None,
+        xgb_min_samples_leaf: int | None = None,
+        xgb_subsample: float | None = None,
+        xgb_feature_fraction: float | None = None,
+        finetuning_lr_adamw: float | None = None,
+        finetuning_lr_lion: float | None = None,
     ) -> None:
         params = locals().copy()
         params.pop("self")
@@ -2848,7 +2902,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         gradient_clip_norm: float = 1.18,
         scheduler_min_lr: float = 6e-7,
         checkpoint: str | None = "xgbrconcat",
-        checkpoint_mix: tuple[str, ...] | list[str] | None = None,
+        checkpoint_mix: str | tuple[str, ...] | list[str] | None = None,
         stratify_sampling: bool = False,
         feature_bagging: bool = False,
         feature_bagging_size: int = 3000,
@@ -2913,6 +2967,12 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         cpu_memory_safety_margin_gb: float = 2.0,
         corr_select_k: int = 0,
         inference_storage_dtype: str | None = "float16",
+        corr_select_k_non_tree: int | None = None,
+        xgb_min_samples_leaf: int | None = None,
+        xgb_subsample: float | None = None,
+        xgb_feature_fraction: float | None = None,
+        finetuning_lr_adamw: float | None = None,
+        finetuning_lr_lion: float | None = None,
     ) -> None:
         params = locals().copy()
         params.pop("self")

@@ -39,187 +39,16 @@ Device is fixed to `"cuda:0"` because CPU execution is very slow and not
 recommended for typical workloads.
 """
 
-from typing import Dict, Any
+from typing import Any
+
 import numpy as np
 
 from .hyperparameter_configs import get_hyperparameter_configs
+from .model_checkpoints import AVAILABLE_CHECKPOINTS, restrict_checkpoint_choices
+from .utils import sample_from_spec
 
-
-AVAILABLE_CHECKPOINTS = [
-    "xgbrconcat",
-    "cbrconcat",
-    "r128bn",
-    "rnobn",
-    "xgb",
-    "catb",
-    "rtr",
-    "rtrcb",
-]
-
-DEFAULT_CHECKPOINT_WEIGHTS = {
-    "xgbrconcat": 8.0,
-    "cbrconcat": 8.0,
-    "r128bn": 1.0,
-    "rnobn": 1.0,
-    "xgb": 0.0,
-    "catb": 0.0,
-    "rtr": 4.0,
-    "rtrcb": 0.0,
-}
-
-NON_TREE_CHECKPOINTS = ("r128bn", "rnobn", "rtr")
-XGBOOST_CHECKPOINTS = ("xgb", "xgbrconcat")
-CATBOOST_CHECKPOINTS = ("catb", "cbrconcat", "rtrcb")
-TREE_CHECKPOINTS = XGBOOST_CHECKPOINTS + CATBOOST_CHECKPOINTS
-FORCED_RETRIEVAL_CHECKPOINTS = ("rtr", "rtrcb")
-
-COMMON_PARAMETER_NAMES = (
-    "device",
-    "n_ensemble",
-    "batch_size",
-    "finetuning",
-    "finetuning_dropout",
-    "finetuning_max_steps",
-    "finetuning_batch_size",
-    "finetuning_data",
-    "finetuning_lr",
-    "gradient_clip_norm",
-    "finetuning_optimizer",
-    "max_train_batches_per_epoch",
-    "finetuning_subset_frac",
-    "finetuning_subset_max_samples",
-    "val_max_samples",
-    "clip_data_value",
-    "rf_size",
-    "pca_sampling",
-    "scheduler_min_lr",
-    "clip_predictions",
-    "corr_select_k",
-    "retrieval_alpha_finetuning",
-    "retrieval_alpha_adaptive",
-    "retrieval_temperature_finetuning",
-)
-
-COMMON_TREE_PARAMETER_NAMES = (
-    "tree_data_split",
-    "tree_for_each_predictor",
-    "tree_n_estimators",
-    "tree_lr",
-    "tree_max_depth",
-    "tree_l2_leaf_reg",
-)
-
-XGBOOST_PARAMETER_NAMES = (
-    "tree_min_samples_leaf",
-    "tree_subsample",
-    "tree_feature_fraction",
-    "tree_gamma",
-)
-
-CATBOOST_PARAMETER_NAMES = ("tree_bagging_temperature",)
-
-RETRIEVAL_PARAMETER_NAMES = (
-    "retrieval_alpha",
-    "retrieval_temperature",
-    "retrieval_distance",
-)
-
-
-# A single hyperparameter specification and the full search space.
-HyperparamSpec = Dict[str, Any]
-SearchSpace = Dict[str, HyperparamSpec]
-
-
-def _rand_log_uniform(rng: np.random.Generator, low: float, high: float) -> float:
-    """
-    Sample from a log-uniform distribution on [low, high].
-
-    Parameters
-    ----------
-    rng : np.random.Generator
-        NumPy random number generator.
-    low : float
-        Lower bound (inclusive).
-    high : float
-        Upper bound (inclusive).
-
-    Returns
-    -------
-    float
-        A value sampled from a log-uniform distribution between low and high.
-    """
-    log_low = np.log(low)
-    log_high = np.log(high)
-    return float(np.exp(rng.uniform(log_low, log_high)))
-
-
-def _checkpoint_family(checkpoint: str | None) -> str | None:
-    if checkpoint is None:
-        return None
-    checkpoint_name = str(checkpoint)
-    if checkpoint_name.endswith(".pth"):
-        checkpoint_name = checkpoint_name[:-4]
-    for family in AVAILABLE_CHECKPOINTS:
-        if checkpoint_name.endswith(family):
-            return family
-    return None
-
-
-def _uses_non_tree_embedding_checkpoint(checkpoint: str | None) -> bool:
-    return _checkpoint_family(checkpoint) in NON_TREE_CHECKPOINTS
-
-
-def _default_checkpoint_probabilities(checkpoints: list[str]) -> list[float]:
-    weights = np.asarray(
-        [
-            DEFAULT_CHECKPOINT_WEIGHTS.get(_checkpoint_family(checkpoint), 1.0)
-            for checkpoint in checkpoints
-        ],
-        dtype=float,
-    )
-    return (weights / weights.sum()).tolist()
-
-
-def _sample_from_spec(
-    rng: np.random.Generator,
-    spec: HyperparamSpec,
-    *,
-    checkpoint: str | None = None,
-) -> Any:
-    """
-    Sample a single value from a HyperparamSpec entry.
-
-    The spec format is intentionally simple:
-
-        {"type": "constant", "value": ...}
-        {"type": "categorical", "choices": [...], "probs": [...]}   # probs optional
-        {"type": "float_uniform", "low": float, "high": float}
-        {"type": "log_uniform",   "low": float, "high": float}
-    """
-    kind = spec["type"]
-
-    if kind == "constant":
-        return spec["value"]
-
-    if kind == "categorical":
-        choices = spec["choices"]
-        probs = spec.get("probs")
-        if _uses_non_tree_embedding_checkpoint(checkpoint):
-            choices = spec.get("non_tree_embedding_choices", choices)
-            probs = spec.get("non_tree_embedding_probs", probs)
-        value = rng.choice(choices, p=probs)
-        # Ensure we return plain Python scalars rather than NumPy scalars
-        if isinstance(value, np.generic):
-            return value.item()
-        return value
-
-    if kind == "float_uniform":
-        return float(rng.uniform(spec["low"], spec["high"]))
-
-    if kind == "log_uniform":
-        return _rand_log_uniform(rng, spec["low"], spec["high"])
-
-    raise ValueError(f"Unknown hyperparameter type {kind!r}")
+HyperparamSpec = dict[str, Any]
+SearchSpace = dict[str, HyperparamSpec]
 
 
 def get_hyperparameter_search_space(
@@ -231,8 +60,8 @@ def get_hyperparameter_search_space(
     Parameters
     ----------
     available_checkpoints : list[str] | None, optional
-        List of checkpoint names to choose from. If None, uses all
-        `AVAILABLE_CHECKPOINTS`.
+        List of checkpoint names or paths to choose from. If None, uses the
+        recommended checkpoint choices.
 
     Returns
     -------
@@ -241,153 +70,45 @@ def get_hyperparameter_search_space(
         Each spec describes the recommended distribution for that parameter.
 
     The specification format is intentionally minimal so that it can be
-    re-expressed in any hyperparameter optimization library (e.g., 
+    re-expressed in any hyperparameter optimization library (e.g.,
     Optuna, Hyperopt, etc.) or custom search procedure.
-
-    A ``checkpoints`` field restricts a parameter to those checkpoint choices.
-    A ``condition`` field restricts a parameter to configurations where the
-    controlling parameter equals the stated value. A
-    ``forced_true_checkpoints`` field identifies checkpoints that force the
-    controlling Boolean parameter to true.
     """
-    use_default_checkpoint_weights = available_checkpoints is None
-    if use_default_checkpoint_weights:
-        available_checkpoints = list(AVAILABLE_CHECKPOINTS)
-    else:
-        available_checkpoints = list(available_checkpoints)
-
-    if not available_checkpoints:
-        raise ValueError("available_checkpoints must contain at least one checkpoint.")
-
-    tree_checkpoints = [
-        checkpoint
-        for checkpoint in available_checkpoints
-        if _checkpoint_family(checkpoint) in TREE_CHECKPOINTS
-    ]
-    xgboost_checkpoints = [
-        checkpoint
-        for checkpoint in available_checkpoints
-        if _checkpoint_family(checkpoint) in XGBOOST_CHECKPOINTS
-    ]
-    catboost_checkpoints = [
-        checkpoint
-        for checkpoint in available_checkpoints
-        if _checkpoint_family(checkpoint) in CATBOOST_CHECKPOINTS
-    ]
-    forced_retrieval_checkpoints = [
-        checkpoint
-        for checkpoint in available_checkpoints
-        if _checkpoint_family(checkpoint) in FORCED_RETRIEVAL_CHECKPOINTS
-    ]
-
-    checkpoint_spec: HyperparamSpec = {
-        "type": "categorical",
-        "choices": available_checkpoints,
-    }
-    if use_default_checkpoint_weights:
-        checkpoint_spec["probs"] = _default_checkpoint_probabilities(
-            available_checkpoints
-        )
-
     space: SearchSpace = {
-        "checkpoint": checkpoint_spec,
+        "checkpoint": {"type": "categorical", "choices": ["cbrconcat", "xgbrconcat", "rtr"], "probs": [0.7, 0.2, 0.1]},
+        "checkpoint_mix": {"type": "categorical", "choices": [None, "default"], "probs": [0.4, 0.6]},
         "device": {"type": "constant", "value": "cuda:0"},
         "n_ensemble": {"type": "categorical", "choices": [8, 12]},
         "batch_size": {"type": "categorical", "choices": [2048, 4096]},
         "finetuning": {"type": "constant", "value": True},
-        "finetuning_dropout": {"type": "categorical", "choices": [0.0, 0.15]},
+        "finetuning_dropout": {"type": "categorical", "choices": [0.0, 0.15], "probs": [0.6, 0.4]},
         "finetuning_max_steps": {"type": "constant", "value": 2048},
         "finetuning_batch_size": {"type": "categorical", "choices": [1024, 2048]},
         "finetuning_data": {"type": "constant", "value": "entire_dataset"},
-        "finetuning_lr": {"type": "log_uniform", "low": 1e-4, "high": 3e-3},
+        "finetuning_lr_adamw": {"type": "log_uniform", "low": 1.7e-4, "high": 5.5e-4},
+        "finetuning_lr_lion": {"type": "log_uniform", "low": 2e-4, "high": 1.5e-3},
         "gradient_clip_norm": {"type": "float_uniform", "low": 0.5, "high": 1.5},
-        "finetuning_optimizer": {"type": "categorical", "choices": ["adamw", "lion"]},
+        "finetuning_optimizer": {"type": "categorical", "choices": ["adamw", "lion"], "probs": [0.4, 0.6]},
         "max_train_batches_per_epoch": {"type": "constant", "value": 128},
         "finetuning_subset_frac": {"type": "constant", "value": None},
         "finetuning_subset_max_samples": {"type": "constant", "value": 100_000},
         "val_max_samples": {"type": "constant", "value": 25_000},
-        "tree_data_split": {
-            "type": "constant",
-            "value": "all",
-            "checkpoints": tree_checkpoints,
-        },
-        "tree_for_each_predictor": {
-            "type": "constant",
-            "value": True,
-            "checkpoints": tree_checkpoints,
-        },
+        "tree_data_split": {"type": "constant", "value": "all"},
+        "tree_for_each_predictor": {"type": "constant", "value": True},
         "tree_n_estimators": {
-            "type": "categorical",
-            "choices": [100, 125, 150, 200],
-            "probs": [0.10, 0.35, 0.20, 0.35],
-            "checkpoints": tree_checkpoints,
+            "type": "categorical", "choices": [100, 125, 150, 200], "probs": [0.1, 0.25, 0.15, 0.5],
         },
-        "tree_lr": {
-            "type": "float_uniform",
-            "low": 5e-2,
-            "high": 0.7,
-            "checkpoints": tree_checkpoints,
-        },
-        "tree_max_depth": {
-            "type": "categorical",
-            "choices": [4, 5, 6],
-            "probs": [0.20, 0.65, 0.15],
-            "checkpoints": tree_checkpoints,
-        },
-        "tree_min_samples_leaf": {
-            "type": "categorical",
-            "choices": [1, 2, 4, 8, 12, 16],
-            "checkpoints": xgboost_checkpoints,
-        },
-        "tree_l2_leaf_reg": {
-            "type": "categorical",
-            "choices": [0.1, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 5.0],
-            "checkpoints": tree_checkpoints,
-        },
-        "tree_subsample": {
-            "type": "float_uniform",
-            "low": 0.5,
-            "high": 1.0,
-            "checkpoints": xgboost_checkpoints,
-        },
-        "tree_feature_fraction": {
-            "type": "float_uniform",
-            "low": 0.6,
-            "high": 1.0,
-            "checkpoints": xgboost_checkpoints,
-        },
-        "tree_gamma": {
-            "type": "categorical",
-            "choices": [0.0, 0.05, 0.1, 0.25, 0.5],
-            "probs": [0.6, 0.1, 0.1, 0.1, 0.1],
-            "checkpoints": xgboost_checkpoints,
-        },
-        "tree_bagging_temperature": {
-            "type": "constant",
-            "value": None,
-            "checkpoints": catboost_checkpoints,
-        },
-        "do_retrieval": {
-            "type": "constant",
-            "value": True,
-            "forced_true_checkpoints": forced_retrieval_checkpoints,
-        },
-        "retrieval_alpha": {
-            "type": "constant",
-            "value": 0.75,
-            "condition": {"parameter": "do_retrieval", "value": True},
-        },
-        "retrieval_temperature": {
-            "type": "float_uniform",
-            "low": 1.0,
-            "high": 2.0,
-            "condition": {"parameter": "do_retrieval", "value": True},
-        },
-        "retrieval_distance": {
-            "type": "constant",
-            "value": "cosine",
-            "condition": {"parameter": "do_retrieval", "value": True},
-        },
+        "tree_lr": {"type": "float_uniform", "low": 5e-2, "high": 0.7},
+        "tree_max_depth": {"type": "categorical", "choices": [4, 5], "probs": [0.3, 0.7]},
+        "tree_min_samples_leaf": {"type": "categorical", "choices": [1, 4, 12], "probs": [0.10, 0.05, 0.85]},
+        "tree_l2_leaf_reg": {"type": "categorical", "choices": [0.75, 1.0, 1.25, 2.0, 2.5, 3.0]},
+        "tree_subsample": {"type": "categorical", "choices": [0.56, 0.63, 0.71], "probs": [0.10, 0.85, 0.05]},
+        "tree_feature_fraction": {"type": "categorical", "choices": [0.65, 0.81, 0.99], "probs": [0.05, 0.10, 0.85]},
+        "tree_gamma": {"type": "categorical", "choices": [0.0, 0.5], "probs": [0.90, 0.10]},
+        "tree_bagging_temperature": {"type": "constant", "value": None},
+        "do_retrieval": {"type": "constant", "value": True},
+        "retrieval_alpha": {"type": "constant", "value": 0.75},
+        "retrieval_temperature": {"type": "float_uniform", "low": 1.0, "high": 2.0},
+        "retrieval_distance": {"type": "constant", "value": "cosine"},
         "retrieval_alpha_finetuning": {"type": "constant", "value": False},
         "retrieval_alpha_adaptive": {"type": "constant", "value": True},
         "retrieval_temperature_finetuning": {"type": "constant", "value": False},
@@ -395,101 +116,20 @@ def get_hyperparameter_search_space(
         "rf_size": {"type": "constant", "value": 32_768},
         "pca_sampling": {"type": "constant", "value": "zeropad"},
         "scheduler_min_lr": {"type": "log_uniform", "low": 1e-7, "high": 2e-6},
-        "clip_predictions": {
-            "type": "categorical",
-            "choices": [False, True],
-            "probs": [0.3, 0.7],
-        },
-        "corr_select_k": {
-            "type": "categorical",
-            "choices": [0, 512, 1024, 2048, 4096],
-            "probs": [0.40, 0.10, 0.15, 0.20, 0.15],
-            "non_tree_embedding_choices": [
-                0,
-                5,
-                10,
-                50,
-                100,
-                200,
-                300,
-                400,
-                512,
-                1024,
-                2048,
-                4096,
-            ],
-            "non_tree_embedding_probs": [
-                20 / 93,
-                2 / 93,
-                3 / 93,
-                5 / 93,
-                10 / 93,
-                15 / 93,
-                15 / 93,
-                8 / 93,
-                8 / 93,
-                3 / 93,
-                2 / 93,
-                2 / 93,
-            ],
-        },
+        "clip_predictions": {"type": "categorical", "choices": [False, True], "probs": [0.3, 0.7]},
+        "corr_select_k": {"type": "categorical", "choices": [0, 300, 512, 1024, 2048], "probs": [0.60, 0.05, 0.10, 0.15, 0.10]},
     }
 
-    return space
-
-
-def _sample_hyperparameters_for_checkpoint(
-    rng: np.random.Generator,
-    space: SearchSpace,
-    checkpoint: str,
-) -> Dict[str, Any]:
-    checkpoint_family = _checkpoint_family(checkpoint)
-    cfg: Dict[str, Any] = {"checkpoint": checkpoint}
-
-    for name in COMMON_PARAMETER_NAMES:
-        cfg[name] = _sample_from_spec(
-            rng,
-            space[name],
-            checkpoint=checkpoint,
-        )
-
-    if checkpoint_family in TREE_CHECKPOINTS:
-        for name in COMMON_TREE_PARAMETER_NAMES:
-            cfg[name] = _sample_from_spec(rng, space[name], checkpoint=checkpoint)
-
-        if checkpoint_family in XGBOOST_CHECKPOINTS:
-            for name in XGBOOST_PARAMETER_NAMES:
-                cfg[name] = _sample_from_spec(rng, space[name], checkpoint=checkpoint)
-        elif checkpoint_family in CATBOOST_CHECKPOINTS:
-            for name in CATBOOST_PARAMETER_NAMES:
-                cfg[name] = _sample_from_spec(rng, space[name], checkpoint=checkpoint)
-
-    if checkpoint_family in FORCED_RETRIEVAL_CHECKPOINTS:
-        cfg["do_retrieval"] = True
-    else:
-        cfg["do_retrieval"] = _sample_from_spec(
-            rng,
-            space["do_retrieval"],
-            checkpoint=checkpoint,
-        )
-
-    if cfg["do_retrieval"]:
-        for name in RETRIEVAL_PARAMETER_NAMES:
-            cfg[name] = _sample_from_spec(rng, space[name], checkpoint=checkpoint)
-
-    return cfg
+    return restrict_checkpoint_choices(space, available_checkpoints)
 
 
 def sample_hyperparameters(
     rng: np.random.Generator,
     available_checkpoints: list[str] | None = None,
-) -> Dict[str, Any]:
-    """
-    Sample a single random configuration from the recommended space.
-    """
+) -> dict[str, Any]:
+    """Sample a single random configuration from the recommended space."""
     space = get_hyperparameter_search_space(available_checkpoints)
-    checkpoint = _sample_from_spec(rng, space["checkpoint"])
-    return _sample_hyperparameters_for_checkpoint(rng, space, checkpoint)
+    return {name: sample_from_spec(rng, spec) for name, spec in space.items()}
 
 
 __all__ = [
