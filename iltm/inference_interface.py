@@ -47,9 +47,6 @@ from iltm.utils import (
 )
 from .model_checkpoints import resolve_checkpoint_mix, resolve_model_checkpoint
 
-torch.set_float32_matmul_precision("high")  # enables TF32 on Ampere+
-torch.backends.cuda.matmul.allow_tf32 = True
-
 logger = logging.getLogger(__name__)
 
 _AUTO_VAL_CHECKS_FULL = 4
