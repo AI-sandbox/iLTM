@@ -41,6 +41,25 @@ def sample_from_spec(rng: np.random.Generator, spec: dict[str, Any]) -> Any:
     raise ValueError(f"Unknown hyperparameter type {kind!r}")
 
 
+@contextlib.contextmanager
+def preserve_random_state():
+    """Restore the caller's RNG states and hash-seed environment after a call."""
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    hash_seed = os.environ.get('PYTHONHASHSEED')
+    devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+    try:
+        with torch.random.fork_rng(devices=devices):
+            yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        if hash_seed is None:
+            os.environ.pop('PYTHONHASHSEED', None)
+        else:
+            os.environ['PYTHONHASHSEED'] = hash_seed
+
+
 def seed_everything(seed: int):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)

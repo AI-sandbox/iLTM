@@ -30,6 +30,7 @@ from iltm.log_config import setup_logging
 from iltm.tree_embedding import TreeEmbedding
 from iltm.realmlp_td_s_preprocessing import get_realmlp_td_s_pipeline_separated
 from iltm.utils import (
+    preserve_random_state,
     seed_everything,
     full_main_forward,
     prepare_retrieval_context,
@@ -174,6 +175,7 @@ class _iLTMBase(BaseEstimator):
 
     _model_cache: Dict[tuple, iLTM] = {}
 
+    @preserve_random_state()
     def __init__(
         self,
         *,
@@ -2648,6 +2650,7 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         params.pop("__class__")
         super().__init__(**params)
 
+    @preserve_random_state()
     def fit(
         self,
         X: np.ndarray | pd.DataFrame,
@@ -2835,6 +2838,7 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         self._prediction_calibration_slope_ = slope
         self._prediction_calibration_intercept_ = intercept
 
+    @preserve_random_state()
     def predict(self, X: np.ndarray | pd.DataFrame) -> np.ndarray:
         check_is_fitted(self)
         yhats = self._predict_ensemble(
@@ -2981,6 +2985,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         super().__init__(**params)
         self.voting = voting
 
+    @preserve_random_state()
     def fit(
         self,
         X: np.ndarray | pd.DataFrame,
@@ -3114,6 +3119,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         logger.debug(f"iLTMClassifier.fit END: Total fit duration={fit_total_duration:.2f}s")
         return result
 
+    @preserve_random_state()
     def predict_proba(self, X: np.ndarray | pd.DataFrame) -> np.ndarray:
         check_is_fitted(self)
         probs = self._predict_ensemble(
@@ -3121,6 +3127,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         )
         return probs.cpu().numpy()
 
+    @preserve_random_state()
     def predict(self, X: np.ndarray | pd.DataFrame) -> np.ndarray:
         if self.voting == 'soft':
             outputs = self.predict_proba(X)
