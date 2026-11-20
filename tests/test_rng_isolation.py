@@ -1,4 +1,5 @@
 import contextlib
+import inspect
 import os
 import pickle
 import random
@@ -94,7 +95,7 @@ def test_public_calls_preserve_rngs_and_match_original_fit(
     # remains identical, including initialization, low-rank PCA and dropout.
     with monkeypatch.context() as original:
         original.setattr(interface._iLTMBase, '__init__', interface._iLTMBase.__init__.__wrapped__)
-        original.setattr(cls, 'fit', cls.fit.__wrapped__)
+        original.setattr(cls, 'fit', inspect.unwrap(cls.fit))
         original.setattr(cls, '_model_cache', {})
         baseline = make_estimator(cls, checkpoint, device, finetuning)
         baseline.fit(X, y, eval_set=eval_set)

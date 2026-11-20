@@ -4,6 +4,8 @@ import os
 import gc
 import math
 import logging
+from functools import wraps
+from threading import RLock
 from typing import List, Tuple, Optional, Dict, Any, Literal
 import time
 import zipfile
@@ -52,6 +54,51 @@ logger = logging.getLogger(__name__)
 _AUTO_VAL_CHECKS_FULL = 4
 _AUTO_VAL_CHECKS_REDUCED = 2
 _AUTO_VAL_CHECKS_SMALL_TRAIN_MAX_ROWS = 25_000
+_CUDA_MATMUL_PRECISION_LOCK = RLock()
+
+
+def _cuda_matmul_override(matmul, effective_precision):
+    # The getter resolves inherited precision. Read it with both ancestors
+    # cleared to distinguish an explicit override from "none" (inherit).
+    if effective_precision == "none" or effective_precision != torch.backends.cudnn.fp32_precision:
+        return effective_precision
+
+    with torch.backends.flags(fp32_precision="none"):
+        cuda_precision = torch.backends.cudnn.fp32_precision
+        if cuda_precision == "none":
+            return matmul.fp32_precision
+        try:
+            torch.backends.cudnn.fp32_precision = "none"
+            return matmul.fp32_precision
+        finally:
+            torch.backends.cudnn.fp32_precision = cuda_precision
+
+
+def _with_tf32(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        allow_tf32 = self.allow_tf32
+        if self.device.type != "cuda":
+            return method(self, *args, **kwargs)
+
+        # An inheriting call must also wait for iLTM's explicit overrides to end.
+        with _CUDA_MATMUL_PRECISION_LOCK:
+            if allow_tf32 is None:
+                return method(self, *args, **kwargs)
+
+            matmul = torch.backends.cuda.matmul
+            try:
+                effective_precision = matmul.fp32_precision
+            except AttributeError as exc:
+                raise RuntimeError("Setting allow_tf32 for CUDA requires PyTorch 2.9 or newer.") from exc
+            previous = _cuda_matmul_override(matmul, effective_precision)
+            try:
+                matmul.fp32_precision = "tf32" if allow_tf32 else "ieee"
+                return method(self, *args, **kwargs)
+            finally:
+                matmul.fp32_precision = previous
+
+    return wrapped
 
 
 def _should_reduce_auto_val_checks(
@@ -171,6 +218,7 @@ class _iLTMBase(BaseEstimator):
     """
 
     _model_cache: Dict[tuple, iLTM] = {}
+    allow_tf32: bool | None = None  # Also the default for older serialized estimators.
 
     @preserve_random_state()
     def __init__(
@@ -257,6 +305,7 @@ class _iLTMBase(BaseEstimator):
         normalize_predictions: bool = False,
         use_amp_inference: bool = False,
         use_amp_finetuning: bool = False,
+        allow_tf32: bool | None = None,
         adaptive_memory: bool = True,
         gpu_mem_low_mb: int = 2048,
         gpu_mem_very_low_mb: int = 1024,
@@ -476,6 +525,7 @@ class _iLTMBase(BaseEstimator):
         # Disable AMP if tree embedding is used, to match previous behavior
         self.use_amp_inference = bool(use_amp_inference) if not self.tree_embedding else False
         self.use_amp_finetuning = bool(use_amp_finetuning) if not self.tree_embedding else False
+        self.allow_tf32 = allow_tf32
 
         # Memory controls
         self.inference_chunk_rows = 10000
@@ -2537,6 +2587,10 @@ class _iLTMBase(BaseEstimator):
 class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
     """
     Scikit-learn like regressor interface for iLTM.
+
+    ``allow_tf32=True`` allows TF32 for CUDA matmuls during fit and prediction.
+    ``False`` uses IEEE FP32 matmuls, and ``None`` uses the caller's setting.
+    An explicit setting on CUDA requires PyTorch 2.9+.
     """
 
     _prediction_calibration_max_rows = 4096
@@ -2623,6 +2677,7 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         normalize_predictions: bool = False,
         use_amp_inference: bool = False,
         use_amp_finetuning: bool = False,
+        allow_tf32: bool | None = None,
         adaptive_memory: bool = True,
         gpu_mem_low_mb: int = 3072,
         gpu_mem_very_low_mb: int = 1024,
@@ -2647,6 +2702,7 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         params.pop("__class__")
         super().__init__(**params)
 
+    @_with_tf32
     @preserve_random_state()
     def fit(
         self,
@@ -2835,6 +2891,7 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         self._prediction_calibration_slope_ = slope
         self._prediction_calibration_intercept_ = intercept
 
+    @_with_tf32
     @preserve_random_state()
     def predict(self, X: np.ndarray | pd.DataFrame) -> np.ndarray:
         check_is_fitted(self)
@@ -2870,6 +2927,10 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
 class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
     """
     Scikit-learn like classifier interface for iLTM.
+
+    ``allow_tf32=True`` allows TF32 for CUDA matmuls during fit and prediction.
+    ``False`` uses IEEE FP32 matmuls, and ``None`` uses the caller's setting.
+    An explicit setting on CUDA requires PyTorch 2.9+.
     """
 
     def __init__(
@@ -2955,6 +3016,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         normalize_predictions: bool = False,     # ignored for classification
         use_amp_inference: bool = False,
         use_amp_finetuning: bool = False,
+        allow_tf32: bool | None = None,
         voting: str = 'soft',
         adaptive_memory: bool = True,
         gpu_mem_low_mb: int = 2048,
@@ -2982,6 +3044,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         super().__init__(**params)
         self.voting = voting
 
+    @_with_tf32
     @preserve_random_state()
     def fit(
         self,
@@ -3116,6 +3179,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         logger.debug(f"iLTMClassifier.fit END: Total fit duration={fit_total_duration:.2f}s")
         return result
 
+    @_with_tf32
     @preserve_random_state()
     def predict_proba(self, X: np.ndarray | pd.DataFrame) -> np.ndarray:
         check_is_fitted(self)
@@ -3124,6 +3188,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         )
         return probs.cpu().numpy()
 
+    @_with_tf32
     @preserve_random_state()
     def predict(self, X: np.ndarray | pd.DataFrame) -> np.ndarray:
         if self.voting == 'soft':
