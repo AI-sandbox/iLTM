@@ -1118,6 +1118,20 @@ class _iLTMBase(BaseEstimator):
             return X.iloc[:, :n_features]
         return X[:, :n_features]
 
+    def _concat_cat_features(self, tree: TreeEmbedding) -> list[int]:
+        """Map categorical features to their positions in the retained original columns."""
+        cat_features = self.cat_features
+        if not cat_features:
+            return []
+        indices = getattr(tree, "orig_feature_indices_to_keep_", None)
+        if indices is not None:
+            categorical = set(cat_features)
+            return [position for position, original in enumerate(indices) if original in categorical]
+        n_features = getattr(tree, "n_orig_features_to_keep_", None)
+        if n_features is not None:
+            return [index for index in cat_features if index < n_features]
+        return cat_features
+
     @staticmethod
     def _combine_preprocessed_columns(
         x_num: np.ndarray,
@@ -1163,6 +1177,7 @@ class _iLTMBase(BaseEstimator):
         *,
         is_classification: bool,
         tree_embedding: bool | None = None,
+        cat_features: list[int] | None = None,
     ) -> Tuple[np.ndarray, np.ndarray, dict]:
 
         logger.debug(f"Preprocessing x {np.shape(x)} with type: {self.preprocessing}")
@@ -1223,7 +1238,7 @@ class _iLTMBase(BaseEstimator):
         elif self.preprocessing == 'realmlp_td_s_v0':
             logger.debug("Preprocessing with realmlp_td_s_v0")
             preprocessing_objects['pipeline'] = get_realmlp_td_s_pipeline_separated(
-                cat_features=self.cat_features,
+                cat_features=self.cat_features if cat_features is None else cat_features,
                 # In the concat checkpoint, thousands of dense binary tree
                 # columns flow through the numerical branch. They ultimately
                 # become float32 in RobustScaleSmoothClipTransform, so prevent
@@ -2023,6 +2038,7 @@ class _iLTMBase(BaseEstimator):
         tree_eval_set = eval_set if self.tree_use_external_eval_set else None
 
         # Single tree path
+        fit_cat_features = None
         if self.tree_embedding and not self.tree_for_each_predictor:
             X_tree, y_tree, X_for_nn, y_for_nn = self._split_data_tree_embedding(
                 X_original, y_proc, random_state=self.seed
@@ -2054,6 +2070,7 @@ class _iLTMBase(BaseEstimator):
 
             if self.concat_tree_with_orig_features:
                 X_for_nn = self._select_original_features_for_tree(self.tr_, X_for_nn)  # type: ignore[arg-type]
+                fit_cat_features = self._concat_cat_features(self.tr_)  # type: ignore[arg-type]
                 X_work = self._concatenate_original_and_tree_features(
                     X_for_nn, X_emb_train
                 )
@@ -2076,7 +2093,10 @@ class _iLTMBase(BaseEstimator):
         if not self._checkpoint_mix_configs and not (
             self.tree_embedding and self.tree_for_each_predictor
         ):
-            X_np, y_np, preproc = self._preprocess_fitting_data(X_work, y_work, is_classification=self.task_type == 'classification')
+            X_np, y_np, preproc = self._preprocess_fitting_data(
+                X_work, y_work, is_classification=self.task_type == 'classification',
+                cat_features=fit_cat_features,
+            )
             self.preprocessors_.append(preproc)
             if X_val_work is not None:
                 X_val_tensor = self._preprocess_test_data(X_val_work, preproc)
@@ -2178,6 +2198,7 @@ class _iLTMBase(BaseEstimator):
                 self.tree_embedding and self.tree_for_each_predictor
             )
             if per_predictor_preprocessing:
+                fit_cat_features = None
                 predictor_tree_embedding = (
                     mixed_config["tree_embedding"]
                     if mixed_config is not None
@@ -2229,6 +2250,7 @@ class _iLTMBase(BaseEstimator):
 
                     if predictor_concat:
                         X_for_nn = self._select_original_features_for_tree(tree, X_for_nn)
+                        fit_cat_features = self._concat_cat_features(tree)
                         X_fit = self._concatenate_original_and_tree_features(
                             X_for_nn, X_emb_tr
                         )
@@ -2254,6 +2276,7 @@ class _iLTMBase(BaseEstimator):
                     X_fit, y_for_nn,
                     is_classification=self.task_type == 'classification',
                     tree_embedding=predictor_tree_embedding,
+                    cat_features=fit_cat_features,
                 )
                 self.preprocessors_.append(preproc)
                 X_val_tensor = None

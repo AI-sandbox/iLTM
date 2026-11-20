@@ -1,5 +1,8 @@
+from types import SimpleNamespace
+
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 
 import iltm.utils as iltm_utils
@@ -84,6 +87,63 @@ def test_xgbrconcat_fitting_output_matches_legacy_object_concat():
     predicted_x = optimized._preprocess_test_data(combined, optimized_preprocessor)
     assert predicted_x.dtype == torch.float32
     np.testing.assert_allclose(predicted_x.numpy(), optimized_x, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tree_for_each_predictor", [False, True])
+def test_wide_tree_concat_remaps_categories_for_fit_and_prediction(monkeypatch, tree_for_each_predictor):
+    X = pd.DataFrame(np.random.default_rng(19).normal(size=(8, 6150)).astype(np.float32))
+    X[1] = [0, 1] * 4
+    X[6148] = pd.Categorical(["a", "b"] * 4)
+    X[6149] = pd.Categorical(["c", "d"] * 4)
+    y = np.arange(len(X)) % 2
+    original_categories = [1, 6148, 6149]
+    model = iLTMClassifier(
+        checkpoint=None, device="cpu", cat_features=original_categories,
+        tree_embedding=True, concat_tree_with_orig_features=True,
+        tree_for_each_predictor=tree_for_each_predictor, tree_data_split="all",
+        n_ensemble=2 if tree_for_each_predictor else 1,
+        retrieval_alpha_adaptive=False, auto_stop_on_low_cpu_memory=False,
+    )
+    model.checkpoint = "unused"
+
+    def make_tree(*, tree_model, seed):
+        if seed == model.seed:
+            retained = np.r_[2:6145, 6148]
+        else:
+            retained = np.r_[:6143, 6149]
+        return SimpleNamespace(
+            orig_feature_indices_to_keep_=retained,
+            fit_tree=lambda *args, **kwargs: None,
+            transform=lambda X: np.ones((len(X), 2), dtype=np.int8),
+        )
+
+    fit_inputs = []
+    predict_inputs = []
+
+    def generate_predictor(X, y, *, X_val, **kwargs):
+        fit_inputs.append(X_val)
+        torch.testing.assert_close(X_val, X[: len(X_val)])
+        return {"timed_out": False}
+
+    def forward(predictor, X, *, n_outputs, **kwargs):
+        predict_inputs.append(X)
+        return torch.zeros((len(X), n_outputs))
+
+    monkeypatch.setattr(model, "_create_tree_embedding", make_tree)
+    monkeypatch.setattr(
+        model, "_initialize_model",
+        lambda: SimpleNamespace(pca_sampling="zeropad", n_dims=2, clip_data_value=1.0),
+    )
+    monkeypatch.setattr(model, "_generate_predictor", generate_predictor)
+    monkeypatch.setattr(model, "_forward_pass_predictor", forward)
+
+    model.fit(X, y, eval_set=(X.iloc[:4], y[:4]))
+    expected = [[6143], [1, 6143]] if tree_for_each_predictor else [[6143]]
+    assert [prep["pipeline"].cat_features for prep in model.preprocessors_] == expected
+    assert model.cat_features == original_categories
+    assert model.predict_proba(X.iloc[:4]).shape == (4, 2)
+    for predicted, fitted in zip(predict_inputs, fit_inputs, strict=True):
+        torch.testing.assert_close(predicted, fitted)
 
 
 def test_predict_once_uses_dtype_preserving_tree_concat(monkeypatch):
