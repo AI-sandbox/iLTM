@@ -337,38 +337,6 @@ class _iLTMBase(BaseEstimator):
         self.logging_level = logging_level
         setup_logging(logging_level=self.logging_level)
 
-        resolved_mix = resolve_checkpoint_mix(checkpoint_mix)
-        primary_checkpoint = resolved_mix[0] if resolved_mix else checkpoint
-
-        # Resolve model checkpoint config if provided
-        if primary_checkpoint is not None:
-            try:
-                checkpoint_config = resolve_model_checkpoint(primary_checkpoint)
-                # Update parameters based on checkpoint configuration
-                for key, value in checkpoint_config.items():
-                    if key == 'checkpoint':
-                        # A mix may resolve its primary path again during clone.
-                        # Keep the supplied object when the path already matches.
-                        if checkpoint != value:
-                            checkpoint = value
-                    elif key == 'preprocessing':
-                        preprocessing = value
-                    elif key == 'tree_embedding':
-                        tree_embedding = value
-                    elif key == 'tree_model':
-                        tree_model = value
-                    elif key == 'do_retrieval':
-                        do_retrieval = value
-                    elif key == 'bottleneck_size':
-                        bottleneck_size = value
-                    elif key == 'concat_tree_with_orig_features':
-                        concat_tree_with_orig_features = value
-                    else:
-                        logger.warning(f"Unknown parameter from checkpoint config: {key}")
-            except ValueError as e:
-                logger.error(f"Failed to resolve model checkpoint: {e}")
-                raise
-
         # Store config
         # Store device as string in __dict__ for sklearn clone compatibility
         # but also store as torch.device for internal use
@@ -476,14 +444,6 @@ class _iLTMBase(BaseEstimator):
         self.tree_bagging_temperature = tree_bagging_temperature
         self.onehot_max_features = bool(onehot_max_features)
 
-        if self.concat_tree_with_orig_features:
-            if self.tree_max_depth is not None and self.tree_max_depth > 8:
-                logger.warning(
-                    f"concat_tree_with_orig_features=True, limiting tree_max_depth "
-                    f"from {self.tree_max_depth} to 8 to avoid OOM errors."
-                )
-                self.tree_max_depth = 8
-
         # Retrieval
         self.do_retrieval = bool(do_retrieval)
         self.retrieval_alpha = float(retrieval_alpha)
@@ -492,46 +452,11 @@ class _iLTMBase(BaseEstimator):
         self.retrieval_alpha_finetuning = bool(retrieval_alpha_finetuning)
         self.retrieval_temperature_finetuning = bool(retrieval_temperature_finetuning)
         self.retrieval_alpha_adaptive = bool(retrieval_alpha_adaptive)
-        if self.do_retrieval and self.retrieval_alpha_adaptive and self.retrieval_alpha_finetuning:
-            raise ValueError(
-                "retrieval_alpha_adaptive and retrieval_alpha_finetuning cannot both be enabled."
-            )
-
-        self._checkpoint_mix_configs: List[dict[str, Any]] = []
-        if resolved_mix is not None:
-            if not self.tree_for_each_predictor:
-                raise ValueError("checkpoint_mix requires tree_for_each_predictor=True.")
-
-            for mixed_checkpoint in resolved_mix:
-                config = resolve_model_checkpoint(mixed_checkpoint)
-                mixed_config = {
-                    "checkpoint": config["checkpoint"],
-                    "preprocessing": config.get("preprocessing", self.preprocessing),
-                    "tree_embedding": bool(config.get("tree_embedding", self.tree_embedding)),
-                    "tree_model": config.get("tree_model", self.tree_model),
-                    "concat_tree_with_orig_features": bool(
-                        config.get(
-                            "concat_tree_with_orig_features",
-                            self.concat_tree_with_orig_features,
-                        )
-                    ),
-                    "bottleneck_size": int(config.get("bottleneck_size", self.bottleneck_size)),
-                    "do_retrieval": bool(config.get("do_retrieval", self.do_retrieval)),
-                }
-                if mixed_config["preprocessing"] != self.preprocessing:
-                    raise ValueError("All mixed checkpoints must use the same preprocessing.")
-                if mixed_config["bottleneck_size"] != self.bottleneck_size:
-                    raise ValueError("All mixed checkpoints must use the same network architecture.")
-                if mixed_config["do_retrieval"] != self.do_retrieval:
-                    raise ValueError("All mixed checkpoints must use the same retrieval setting.")
-                self._checkpoint_mix_configs.append(mixed_config)
-
         # These flags will be respected only for regression
         self.clip_predictions = bool(clip_predictions) if self.task_type == 'regression' else False
         self.normalize_predictions = bool(normalize_predictions) if self.task_type == 'regression' else False
-        # Disable AMP if tree embedding is used, to match previous behavior
-        self.use_amp_inference = bool(use_amp_inference) if not self.tree_embedding else False
-        self.use_amp_finetuning = bool(use_amp_finetuning) if not self.tree_embedding else False
+        self.use_amp_inference = bool(use_amp_inference)
+        self.use_amp_finetuning = bool(use_amp_finetuning)
         self.allow_tf32 = allow_tf32
 
         # Memory controls
@@ -558,12 +483,68 @@ class _iLTMBase(BaseEstimator):
         # Placeholders
         self.tr_: TreeEmbedding | List[TreeEmbedding | None] | None = None
 
-        self.model_path = self.checkpoint
+        self._configure_checkpoints()
         self._model: iLTM | None = None
 
         self.predictors_: List[dict] = []
         self.preprocessors_: List[dict] = []
         self.predictor_configs_: List[dict] = []
+
+    def _configure_checkpoints(self, **updates):
+        """Resolve and validate the selection before applying any parameter updates."""
+        params = (self.get_params(deep=False) | updates) if updates else vars(self)
+        primary = {
+            key: params[key]
+            for key in (
+                "checkpoint", "preprocessing", "tree_embedding", "tree_model",
+                "concat_tree_with_orig_features", "bottleneck_size", "do_retrieval",
+            )
+        }
+        mix = resolve_checkpoint_mix(params["checkpoint_mix"])
+        members = []
+        if mix:
+            if not params["tree_for_each_predictor"]:
+                raise ValueError("checkpoint_mix requires tree_for_each_predictor=True.")
+            configs = [resolve_model_checkpoint(name) for name in mix]
+            primary.update(configs[0])
+            for config in configs:
+                member = {**primary, **config}
+                if member["preprocessing"] != primary["preprocessing"]:
+                    raise ValueError("All mixed checkpoints must use the same preprocessing.")
+                if member["bottleneck_size"] != primary["bottleneck_size"]:
+                    raise ValueError("All mixed checkpoints must use the same network architecture.")
+                if member["do_retrieval"] != primary["do_retrieval"]:
+                    raise ValueError("All mixed checkpoints must use the same retrieval setting.")
+                members.append(member)
+        elif primary["checkpoint"] is not None:
+            primary.update(resolve_model_checkpoint(primary["checkpoint"]))
+
+        if primary["do_retrieval"] and params["retrieval_alpha_adaptive"] and params["retrieval_alpha_finetuning"]:
+            raise ValueError("retrieval_alpha_adaptive and retrieval_alpha_finetuning cannot both be enabled.")
+
+        depth = params["tree_max_depth"]
+        if primary["concat_tree_with_orig_features"] and depth is not None and depth > 8:
+            logger.warning(
+                "concat_tree_with_orig_features=True, limiting tree_max_depth from %s to 8 to avoid OOM errors.",
+                depth,
+            )
+            depth = 8
+        primary["tree_max_depth"] = depth
+        primary["use_amp_inference"] = params["use_amp_inference"] and not primary["tree_embedding"]
+        primary["use_amp_finetuning"] = params["use_amp_finetuning"] and not primary["tree_embedding"]
+
+        if updates:
+            changed = self._checkpoint_mix_configs != members or any(
+                getattr(self, key) != value for key, value in primary.items()
+            )
+            super().set_params(**updates)
+            if changed:
+                self._invalidate_fitted_state()
+        # Keep the inputs for cloning and for restoring the standalone checkpoint.
+        self._requested_checkpoint_params = {key: params[key] for key in primary}
+        self.__dict__.update(primary)
+        self.model_path = self.checkpoint
+        self._checkpoint_mix_configs = members
 
     def _resolve_finetuning_lr(self) -> float:
         """Resolve the active optimizer's override without changing public params."""
@@ -835,6 +816,7 @@ class _iLTMBase(BaseEstimator):
 
     def get_params(self, deep=True):
         params = super().get_params(deep=deep)
+        params.update(getattr(self, "_requested_checkpoint_params", {}))
         # Ensure device is returned as string for sklearn clone compatibility
         # Get the string version from __dict__ if available
         if 'device' in self.__dict__:
@@ -842,6 +824,18 @@ class _iLTMBase(BaseEstimator):
         elif 'device' in params and isinstance(params['device'], torch.device):
             params['device'] = str(params['device'])
         return params
+
+    def set_params(self, **params):
+        requested = getattr(self, "_requested_checkpoint_params", {})
+        mix_options = {"tree_for_each_predictor", "retrieval_alpha_adaptive", "retrieval_alpha_finetuning"}
+        if "checkpoint" in params or "checkpoint_mix" in params or (
+            self.checkpoint_mix is not None and (requested.keys() | mix_options).intersection(params)
+        ):
+            self._configure_checkpoints(**params)
+        else:
+            super().set_params(**params)
+            requested.update({key: value for key, value in params.items() if key in requested})
+        return self
 
     def __getstate__(self):
         """Exclude the pretrained model from serialized estimators."""

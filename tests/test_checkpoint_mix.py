@@ -1,11 +1,14 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from sklearn.base import clone
+from sklearn.exceptions import NotFittedError
 
-import iltm.inference_interface as inference_interface
-from iltm.inference_interface import iLTMClassifier
+from iltm import inference_interface
+from iltm.iltm_model import iLTM
+from iltm.inference_interface import iLTMClassifier, iLTMRegressor
 
 
 def _checkpoint_config(name):
@@ -62,6 +65,70 @@ def test_checkpoint_mix_is_cloneable(monkeypatch):
         "/xgb.pth",
         "/rtr.pth",
     ]
+
+
+@pytest.mark.parametrize("estimator_class", [iLTMClassifier, iLTMRegressor])
+def test_set_params_refits_with_selected_checkpoints(tmp_path, monkeypatch, estimator_class):
+    architecture = {"n_dims": 4, "hn_n_layers": 3, "hn_hidden_size": 8, "rf_size": 12, "n_classes_limit": 5}
+    base, first, second = [str(tmp_path / f"{name}.pth") for name in ("base", "first", "second")]
+    with torch.random.fork_rng(devices=[]):
+        torch.default_generator.manual_seed(19)
+        for path in (base, first, second):
+            torch.save(iLTM(**architecture).state_dict(), path)
+    monkeypatch.setattr(estimator_class, "_model_cache", {})
+    params = dict(
+        checkpoint=base, device="cpu", n_ensemble=2, finetuning=False, preprocessing="none",
+        tree_embedding=False, retrieval_alpha_adaptive=False, auto_stop_on_low_cpu_memory=False,
+        **architecture,
+    )
+    rng = np.random.default_rng(7)
+    X = rng.normal(size=(24, 6)).astype(np.float32)
+    y = np.arange(len(X)) % 2 if estimator_class is iLTMClassifier else rng.normal(size=len(X))
+    predict = estimator_class.predict_proba if estimator_class is iLTMClassifier else estimator_class.predict
+
+    estimator = estimator_class(**params)
+    for mix in ([first, second], (second, second), None):
+        assert estimator.set_params(checkpoint_mix=mix) is estimator
+        with pytest.raises(NotFittedError):
+            predict(estimator, X)
+        estimator.fit(X, y)
+        reference = estimator_class(**params, checkpoint_mix=mix).fit(X, y)
+        assert estimator.model_path == (mix[-1] if mix else base)
+        assert [config["checkpoint"] for config in estimator.predictor_configs_] == list(mix or ())
+        np.testing.assert_array_equal(predict(estimator, X), predict(reference, X))
+
+
+def test_clearing_mix_restores_checkpoint_and_its_settings_after_clone(monkeypatch):
+    monkeypatch.setattr(inference_interface, "resolve_model_checkpoint", _checkpoint_config)
+    params = {"checkpoint": "rtr", "device": "cpu", "tree_max_depth": 12, "use_amp_inference": True}
+    estimator = iLTMClassifier(**params, checkpoint_mix=("cb", "xgb"))
+    assert estimator.tree_max_depth == 8
+    assert not estimator.use_amp_inference
+
+    estimator = clone(estimator).set_params(checkpoint_mix=None)
+    reference = iLTMClassifier(**params)
+    assert estimator.checkpoint == reference.checkpoint == "/rtr.pth"
+    assert estimator.tree_max_depth == reference.tree_max_depth == 12
+    assert estimator.use_amp_inference and not estimator.tree_embedding
+
+
+def test_set_params_validates_the_whole_checkpoint_selection(monkeypatch):
+    monkeypatch.setattr(inference_interface, "resolve_model_checkpoint", _checkpoint_config)
+    estimator = iLTMClassifier(checkpoint="base", tree_for_each_predictor=False, device="cpu")
+    with pytest.raises(ValueError, match="tree_for_each_predictor=True"):
+        estimator.set_params(checkpoint_mix=("cb", "xgb"))
+    assert estimator.checkpoint_mix is None
+    assert estimator.checkpoint == "/base.pth"
+
+    estimator.set_params(checkpoint_mix=("cb", "xgb"), tree_for_each_predictor=True, checkpoint="rtr")
+    with pytest.raises(ValueError, match="checkpoint_mix"):
+        estimator.set_params(checkpoint_mix="unknown")
+    assert estimator.checkpoint_mix == ("cb", "xgb")
+    assert estimator.checkpoint == "/cb.pth"
+    estimator.set_params(checkpoint_mix="default")
+    assert estimator._checkpoint_mix_configs == iLTMClassifier(checkpoint_mix="default")._checkpoint_mix_configs
+    estimator.set_params(checkpoint_mix=None)
+    assert estimator.checkpoint == "/rtr.pth"
 
 
 def test_checkpoint_mix_fits_each_predictor_with_its_checkpoint(monkeypatch):
