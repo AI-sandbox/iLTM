@@ -25,7 +25,7 @@ def test_stratified_bootstrap_sampling(monkeypatch, dictionary_input):
 
     bootstrap_upper_bounds = []
 
-    def balanced_bootstrap_indices(low, high, size):
+    def balanced_bootstrap_indices(low, high, size, *, generator=None):
         assert low == 0
         bootstrap_upper_bounds.append(high)
         return torch.arange(size[0]) % high

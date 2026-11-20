@@ -197,7 +197,7 @@ def test_contiguous_slices_preserve_rows_and_batch_boundaries(monkeypatch):
 
 
 @pytest.mark.parametrize("retry", [False, True])
-def test_sliced_batches_preserve_dataloader_rng_state(monkeypatch, retry):
+def test_sliced_batches_leave_rng_untouched(monkeypatch, retry):
     estimator, _ = _make_estimator("regression")
     estimator.batch_size = 256
     predictor = estimator.predictors_[0]
@@ -214,13 +214,8 @@ def test_sliced_batches_preserve_dataloader_rng_state(monkeypatch, retry):
     monkeypatch.setattr(interface, "full_main_forward", forward)
     monkeypatch.setattr(interface, "clear_cuda_cache", lambda: None)
     start_state = torch.get_rng_state()
-    dataset = torch.utils.data.TensorDataset(X)
-    for batch_size in [256, 128] if retry else [256]:
-        list(torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False))
-    expected_state = torch.get_rng_state()
-    torch.set_rng_state(start_state)
     actual = estimator._forward_pass_predictor(predictor, X, n_outputs=1)
-    torch.testing.assert_close(torch.get_rng_state(), expected_state, rtol=0, atol=0)
+    torch.testing.assert_close(torch.get_rng_state(), start_state, rtol=0, atol=0)
     torch.testing.assert_close(actual, X[:, 0], rtol=0, atol=0)
     assert calls == ([256, 44, 128, 128, 44] if retry else [256, 44])
 

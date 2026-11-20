@@ -34,8 +34,6 @@ from iltm.log_config import setup_logging
 from iltm.tree_embedding import TreeEmbedding
 from iltm.realmlp_td_s_preprocessing import get_realmlp_td_s_pipeline_separated
 from iltm.utils import (
-    preserve_random_state,
-    seed_everything,
     full_main_forward,
     prepare_retrieval_context,
     fine_tune_main_network,
@@ -50,6 +48,7 @@ from iltm.utils import (
     detect_object_string_columns,
     robust_roc_auc_score,
 )
+from ._random import fit_random_generators, torch_generator
 from .model_checkpoints import resolve_checkpoint_mix, resolve_model_checkpoint
 
 logger = logging.getLogger(__name__)
@@ -223,7 +222,6 @@ class _iLTMBase(BaseEstimator):
     allow_tf32: bool | None = None  # Also the default for older serialized estimators.
     n_jobs: int | None = None
 
-    @preserve_random_state()
     def __init__(
         self,
         *,
@@ -559,7 +557,6 @@ class _iLTMBase(BaseEstimator):
 
         # Placeholders
         self.tr_: TreeEmbedding | List[TreeEmbedding | None] | None = None
-        seed_everything(self.seed)
 
         self.model_path = self.checkpoint
         self._model: iLTM | None = None
@@ -918,21 +915,23 @@ class _iLTMBase(BaseEstimator):
             model.eval()
             return model
 
-        model = iLTM(
-            n_dims=self.n_dims,
-            hn_n_layers=self.hn_n_layers,
-            hn_hidden_size=self.hn_hidden_size,
-            clip_data_value=self.clip_data_value,
-            rf_size=self.rf_size,
-            n_classes_limit=self.n_classes_limit,
-            dim_exp_type=self.dim_exp_type,
-            bottleneck_size=self.bottleneck_size,
-            main_n_layers=self.main_n_layers,
-            pca_fit=self.pca_fit,
-            pca_svd_driver=self.pca_svd_driver,
-            hyper_dropout=self.hyper_dropout,
-            pca_sampling=self.pca_sampling,
-        )
+        with torch.device("meta"):
+            model = iLTM(
+                n_dims=self.n_dims,
+                hn_n_layers=self.hn_n_layers,
+                hn_hidden_size=self.hn_hidden_size,
+                clip_data_value=self.clip_data_value,
+                rf_size=self.rf_size,
+                n_classes_limit=self.n_classes_limit,
+                dim_exp_type=self.dim_exp_type,
+                bottleneck_size=self.bottleneck_size,
+                main_n_layers=self.main_n_layers,
+                pca_fit=self.pca_fit,
+                pca_svd_driver=self.pca_svd_driver,
+                hyper_dropout=self.hyper_dropout,
+                pca_sampling=self.pca_sampling,
+            )
+        model.to_empty(device="cpu")
 
         state_dict: Dict[str, Any] = {}
 
@@ -1005,7 +1004,7 @@ class _iLTMBase(BaseEstimator):
                             can_assign = False
                             break
                 if can_assign:
-                    # Keep constructor RNG draws; replace weights before device transfer.
+                    # Replace CPU weights before device transfer.
                     model.load_state_dict(modified_state_dict, assign=True)
                 else:
                     model.to(self.device)
@@ -1015,11 +1014,20 @@ class _iLTMBase(BaseEstimator):
                 raise FileNotFoundError(f"Model file not found at {self.model_path}") from e
             except RuntimeError as e:
                 raise RuntimeError(f"Failed to load the model from {self.model_path}") from e
+            self._model_cache[cache_key] = model
         else:
+            # Empty checkpoints use fresh initial weights. Keep this separate
+            # from training draws and from the shared cache of loaded weights.
+            generator = torch.Generator().manual_seed(self.seed)
+            for layer in model.modules():
+                if isinstance(layer, nn.Linear):
+                    nn.init.kaiming_uniform_(layer.weight, a=math.sqrt(5), generator=generator)
+                    if layer.bias is not None:
+                        bound = 1 / math.sqrt(layer.in_features) if layer.in_features else 0
+                        nn.init.uniform_(layer.bias, -bound, bound, generator=generator)
             model.to(self.device)
 
         model.eval()
-        self._model_cache[cache_key] = model
         return model
 
     def _auto_tune_for_memory(self):
@@ -1412,14 +1420,15 @@ class _iLTMBase(BaseEstimator):
         n_features = X['x_num'].shape[1] + X['x_cat'].shape[1] if isinstance(X, dict) else X.shape[1]
         len_X = X['x_num'].shape[0] if isinstance(X, dict) else X.shape[0]
 
+        generator = torch_generator()
         feature_idxs = None
         if self.feature_bagging and n_features >= self.feature_bagging_size:
             logger.debug("Performing feature bagging")
             if self.feature_bagging_type == 'uniform':
-                feature_idxs = torch.randperm(n_features)[: self.feature_bagging_size]
+                feature_idxs = torch.randperm(n_features, generator=generator)[: self.feature_bagging_size]
             elif self.feature_bagging_type == 'std_multinomial':
                 stds = torch.std(X if not isinstance(X, dict) else torch.cat([X['x_num'], X['x_cat']], dim=1), dim=0)  # type: ignore[arg-type]
-                feature_idxs = torch.multinomial(stds, self.feature_bagging_size, replacement=False)
+                feature_idxs = torch.multinomial(stds, self.feature_bagging_size, replacement=False, generator=torch_generator(stds.device))
             else:
                 raise ValueError(f"Invalid feature bagging type: {self.feature_bagging_type}")
             if not isinstance(X, dict):
@@ -1433,12 +1442,12 @@ class _iLTMBase(BaseEstimator):
             for cls in classes:
                 cls_indices = (y == cls).nonzero(as_tuple=True)[0]
                 n_samples = min(samples_per_class, len(cls_indices))
-                cls_sampled_indices = cls_indices[torch.randperm(len(cls_indices))[:n_samples]]
+                cls_sampled_indices = cls_indices[torch.randperm(len(cls_indices), generator=generator)[:n_samples]]
                 sampled_indices.append(cls_sampled_indices)
             sampled_indices = torch.cat(sampled_indices)
-            sampled_indices = sampled_indices[torch.randperm(len(sampled_indices))]
+            sampled_indices = sampled_indices[torch.randperm(len(sampled_indices), generator=generator)]
         else:
-            sampled_indices = torch.randperm(len_X)[: self.batch_size]
+            sampled_indices = torch.randperm(len_X, generator=generator)[: self.batch_size]
 
         if isinstance(X, dict):
             y_pred = y[sampled_indices]
@@ -1464,6 +1473,7 @@ class _iLTMBase(BaseEstimator):
                     0,
                     y_pred.shape[0],
                     (additional_samples_needed,),
+                    generator=generator,
                 )
                 if isinstance(X_pred, dict):
                     X_pred['x_num'] = torch.cat([X_pred['x_num'], X_pred['x_num'][bootstrap_indices]])
@@ -1648,7 +1658,7 @@ class _iLTMBase(BaseEstimator):
             max_ctxt = int(self.retrieval_context_max_rows)
             sample_size = min(max_ctxt, int(num_rows))
             if sample_size < num_rows:
-                idx = torch.randperm(num_rows)[:sample_size]
+                idx = torch.randperm(num_rows, generator=torch_generator())[:sample_size]
             else:
                 idx = torch.arange(num_rows)
             if isinstance(X, dict):
@@ -1751,8 +1761,6 @@ class _iLTMBase(BaseEstimator):
 
         while True:
             try:
-                # Match the seed consumed by DataLoader's iterator, including retries.
-                torch.empty((), dtype=torch.int64).random_().item()
                 for start in range(0, len(X_concat), bs):
                     Xb = X_concat[start : start + bs].contiguous().to(self.device)
                     model_cfg = self._get_inference_model_config()
@@ -1937,7 +1945,6 @@ class _iLTMBase(BaseEstimator):
         self.predictors_ = []
         self.preprocessors_ = []
         self.predictor_configs_ = []
-        seed_everything(self.seed)
         self._auto_tune_for_memory()
         
         # Detect object columns with string content and add them to cat_features
@@ -2752,7 +2759,6 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         super().__init__(**params)
 
     @_with_torch_settings
-    @preserve_random_state()
     def fit(
         self,
         X: np.ndarray | pd.DataFrame,
@@ -2838,14 +2844,15 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         self.n_outputs_ = 1
         
         try:
-            result = self._fit_common(
-                X, y_proc,
-                eval_set=eval_set_proc,
-                n_outputs=self.n_outputs_,
-                fit_deadline=fit_deadline,
-                fit_time_cushion_frac=fit_time_cushion_frac,
-                return_partial_on_timeout=return_partial_on_timeout,
-            )
+            with fit_random_generators(self.seed):
+                result = self._fit_common(
+                    X, y_proc,
+                    eval_set=eval_set_proc,
+                    n_outputs=self.n_outputs_,
+                    fit_deadline=fit_deadline,
+                    fit_time_cushion_frac=fit_time_cushion_frac,
+                    return_partial_on_timeout=return_partial_on_timeout,
+                )
             self._fit_succeeded = True
             if self.retrieval_alpha_adaptive:
                 if eval_set_proc is None:
@@ -2940,7 +2947,6 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         self._prediction_calibration_intercept_ = intercept
 
     @_with_torch_settings
-    @preserve_random_state()
     def predict(self, X: np.ndarray | pd.DataFrame) -> np.ndarray:
         check_is_fitted(self)
         yhats = self._predict_ensemble(
@@ -3097,7 +3103,6 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         self.voting = voting
 
     @_with_torch_settings
-    @preserve_random_state()
     def fit(
         self,
         X: np.ndarray | pd.DataFrame,
@@ -3201,14 +3206,15 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
                 eval_set = eval_X, eval_y_proc
 
         try:
-            result = self._fit_common(
-                X, y_proc,
-                eval_set=eval_set,
-                n_outputs=self.n_outputs_,
-                fit_deadline=fit_deadline,
-                fit_time_cushion_frac=fit_time_cushion_frac,
-                return_partial_on_timeout=return_partial_on_timeout,
-            )
+            with fit_random_generators(self.seed):
+                result = self._fit_common(
+                    X, y_proc,
+                    eval_set=eval_set,
+                    n_outputs=self.n_outputs_,
+                    fit_deadline=fit_deadline,
+                    fit_time_cushion_frac=fit_time_cushion_frac,
+                    return_partial_on_timeout=return_partial_on_timeout,
+                )
             self._fit_succeeded = True
             if self.retrieval_alpha_adaptive:
                 if eval_set is None:
@@ -3233,7 +3239,6 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         return result
 
     @_with_torch_settings
-    @preserve_random_state()
     def predict_proba(self, X: np.ndarray | pd.DataFrame) -> np.ndarray:
         check_is_fitted(self)
         probs = self._predict_ensemble(
@@ -3242,7 +3247,6 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         return probs.cpu().numpy()
 
     @_with_torch_settings
-    @preserve_random_state()
     def predict(self, X: np.ndarray | pd.DataFrame) -> np.ndarray:
         if self.voting == 'soft':
             outputs = self.predict_proba(X)

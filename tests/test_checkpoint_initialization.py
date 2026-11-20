@@ -100,7 +100,10 @@ def test_initialization_preserves_weights_rng_and_aliases(tmp_path, case):
         model = initialize(estimator(path))
         results.append((model, torch.get_rng_state()))
     original, optimized = results
-    assert torch.equal(original[1], optimized[1])
+    assert torch.equal(optimized[1], torch.Generator().manual_seed(103).get_state())
+    if case == "empty":
+        # A weightless checkpoint initializes from the estimator seed.
+        original = (estimator(path)._initialize_model(), optimized[1])
     assert original[0].training is optimized[0].training is False
     for key, value in original[0].state_dict().items():
         assert torch.equal(value, optimized[0].state_dict()[key]), key
@@ -169,8 +172,8 @@ def test_nondefault_dtype_conversion_is_preserved(tmp_path, default_dtype):
         torch.set_default_dtype(default_dtype)
         torch.manual_seed(719)
         reference = baseline_initialize(estimator(path))
-        expected_rng = torch.get_rng_state()
         torch.manual_seed(719)
+        expected_rng = torch.get_rng_state()
         actual = estimator(path)._initialize_model()
         assert torch.equal(expected_rng, torch.get_rng_state())
         for key, value in reference.state_dict().items():

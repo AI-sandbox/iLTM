@@ -1,5 +1,5 @@
 import contextlib
-import inspect
+from concurrent.futures import ThreadPoolExecutor
 import os
 import pickle
 import random
@@ -11,7 +11,8 @@ import torch
 import iltm.inference_interface as interface
 from iltm import iLTMClassifier, iLTMRegressor
 from iltm.iltm_model import iLTM
-from iltm.utils import preserve_random_state, seed_everything
+from iltm._random import dropout, fit_random_generators, numpy_random_state, torch_generator
+from iltm.utils import TorchPCA, _BatchedTensorSubset
 
 
 ARCHITECTURE = dict(
@@ -24,7 +25,7 @@ def snapshot():
     return (
         random.getstate(), pickle.dumps(np.random.get_state()),
         torch.get_rng_state().clone(), torch.cuda.get_rng_state_all(),
-        os.environ.get('PYTHONHASHSEED'),
+        os.environ.get('PYTHONHASHSEED'), torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic,
     )
 
 
@@ -34,12 +35,12 @@ def assert_restored(expected):
     assert torch.equal(actual[2], expected[2])
     assert len(actual[3]) == len(expected[3])
     assert all(torch.equal(a, b) for a, b in zip(actual[3], expected[3]))
-    assert actual[4] == expected[4]
+    assert actual[4:] == expected[4:]
 
 
 @pytest.mark.parametrize('hash_seed', [None, '', '123'])
 @pytest.mark.parametrize('fail', [False, True])
-def test_context_restores_rngs_and_environment_even_on_error(monkeypatch, hash_seed, fail):
+def test_context_restores_rngs_and_leaves_hash_seed_alone(monkeypatch, hash_seed, fail):
     if hash_seed is None:
         monkeypatch.delenv('PYTHONHASHSEED', raising=False)
     else:
@@ -47,13 +48,12 @@ def test_context_restores_rngs_and_environment_even_on_error(monkeypatch, hash_s
     before = snapshot()
     error_context = pytest.raises(ValueError, match='test failure') if fail else contextlib.nullcontext()
     with error_context:
-        with preserve_random_state():
-            seed_everything(19)
-            random.random()
-            np.random.uniform(size=3)
-            torch.rand(3)
+        with fit_random_generators(19):
+            assert os.environ.get('PYTHONHASHSEED') == hash_seed
+            numpy_random_state().uniform(size=3)
+            torch.rand(3, generator=torch_generator())
             if torch.cuda.is_available():
-                torch.rand(3, device='cuda')
+                torch.rand(3, device='cuda', generator=torch_generator('cuda'))
             if fail:
                 raise ValueError('test failure')
     assert_restored(before)
@@ -62,8 +62,8 @@ def test_context_restores_rngs_and_environment_even_on_error(monkeypatch, hash_s
 @pytest.fixture
 def checkpoint(tmp_path):
     path = tmp_path / 'small.pth'
-    with preserve_random_state():
-        torch.manual_seed(19)
+    with torch.random.fork_rng(devices=[]):
+        torch.default_generator.manual_seed(19)
         torch.save(iLTM(**ARCHITECTURE).state_dict(), path)
     return path
 
@@ -71,7 +71,7 @@ def checkpoint(tmp_path):
 def make_estimator(cls, checkpoint, device, finetuning):
     return cls(
         checkpoint=str(checkpoint), device=device, n_ensemble=2,
-        batch_size=16, preprocessing='none', pca_sampling='zeropad',
+        batch_size=16, preprocessing='none', pca_sampling='zeropad', pca_fit='lowrank',
         tree_embedding=False, adaptive_memory=False,
         auto_stop_on_low_cpu_memory=False, inference_storage_dtype='float32',
         finetuning=finetuning, finetuning_max_steps=2,
@@ -83,7 +83,7 @@ def make_estimator(cls, checkpoint, device, finetuning):
 @pytest.mark.parametrize('cls', [iLTMClassifier, iLTMRegressor])
 @pytest.mark.parametrize('finetuning', [False, True])
 @pytest.mark.parametrize('device', ['cpu', pytest.param('cuda:0', marks=pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable'))])
-def test_public_calls_preserve_rngs_and_match_original_fit(
+def test_public_calls_preserve_rngs_and_match_cached_fit(
     monkeypatch, checkpoint, cls, finetuning, device,
 ):
     rng = np.random.default_rng(7)
@@ -91,18 +91,15 @@ def test_public_calls_preserve_rngs_and_match_original_fit(
     y = np.arange(len(X)) % 2 if cls is iLTMClassifier else rng.normal(size=len(X)).astype(np.float32)
     eval_set = (X[:8], y[:8])
 
-    # Run the original entry points to verify that the learning computation
-    # remains identical, including initialization, low-rank PCA and dropout.
-    with monkeypatch.context() as original:
-        original.setattr(interface._iLTMBase, '__init__', interface._iLTMBase.__init__.__wrapped__)
-        original.setattr(cls, 'fit', inspect.unwrap(cls.fit))
-        original.setattr(cls, '_model_cache', {})
-        baseline = make_estimator(cls, checkpoint, device, finetuning)
-        baseline.fit(X, y, eval_set=eval_set)
-        expected = baseline.predict_proba(X[:7]) if cls is iLTMClassifier else baseline.predict(X[:7])
-
     monkeypatch.setattr(cls, '_model_cache', {})
     before = snapshot()
+    first = make_estimator(cls, checkpoint, device, finetuning)
+    assert_restored(before)
+    first.fit(X, y, eval_set=eval_set)
+    assert_restored(before)
+    expected = first.predict_proba(X[:7]) if cls is iLTMClassifier else first.predict(X[:7])
+    assert_restored(before)
+    assert cls._model_cache
     model = make_estimator(cls, checkpoint, device, finetuning)
     assert_restored(before)
     assert model.fit(X, y, eval_set=eval_set) is model
@@ -128,4 +125,88 @@ def test_failed_fit_preserves_caller_state(monkeypatch, checkpoint, cls):
     before = snapshot()
     with pytest.raises(ValueError, match='test failure'):
         model.fit(np.arange(96, dtype=np.float32).reshape(16, 6), np.arange(16) % 2)
+    assert_restored(before)
+
+
+def test_concurrent_draws_follow_the_callers_sequence(monkeypatch, checkpoint):
+    model = make_estimator(iLTMClassifier, checkpoint, 'cpu', True)
+    python_rng = random.Random()
+    python_rng.setstate(random.getstate())
+    numpy_rng = np.random.RandomState()
+    numpy_rng.set_state(np.random.get_state())
+    torch_rng = torch.Generator().set_state(torch.get_rng_state())
+    expected = [
+        (python_rng.random(), numpy_rng.random_sample(), torch.rand((), generator=torch_rng).item())
+        for _ in range(3)
+    ]
+
+    def draw():
+        return random.random(), np.random.random_sample(), torch.rand(()).item()
+
+    tune = model._auto_tune_for_memory
+    with ThreadPoolExecutor(max_workers=1) as other_thread:
+        during = []
+
+        def draw_during_fit():
+            during.append(other_thread.submit(draw).result())
+            return tune()
+
+        monkeypatch.setattr(model, '_auto_tune_for_memory', draw_during_fit)
+        first = other_thread.submit(draw).result()
+        X = np.arange(96, dtype=np.float32).reshape(16, 6)
+        model.fit(X, np.arange(16) % 2)
+        last = other_thread.submit(draw).result()
+    assert [first, *during, last] == expected
+
+
+@pytest.mark.parametrize('device', ['cpu', pytest.param('cuda:0', marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason='CUDA unavailable'))])
+def test_training_draws_advance_and_repeat(monkeypatch, checkpoint, device):
+    X = np.random.default_rng(7).normal(size=(32, 6)).astype(np.float32)
+    y = np.arange(len(X)) % 2
+    fetch_batch = _BatchedTensorSubset.__getitems__
+    monkeypatch.setattr(iLTMClassifier, '_model_cache', {})
+
+    def fit(seed):
+        batches, masks = [], []
+
+        def record_batch(dataset, indices):
+            batches.append(tuple(dataset.indices[torch.as_tensor(indices)].tolist()))
+            return fetch_batch(dataset, indices)
+
+        def record_dropout(x, p, training):
+            out = dropout(x, p=p, training=training)
+            if training and p > 0 and x.requires_grad:
+                # The derivative gives the actual mask, even for zero-valued inputs.
+                mask, = torch.autograd.grad(out, x, torch.ones_like(out), retain_graph=True)
+                masks.append(mask.detach().ne(0).cpu().numpy().tobytes())
+            return out
+
+        model = make_estimator(iLTMClassifier, checkpoint, device, True)
+        model.set_params(seed=seed, finetuning_data='bootstrap')
+        with monkeypatch.context() as trace:
+            trace.setattr(_BatchedTensorSubset, '__getitems__', record_batch)
+            trace.setattr('iltm.utils.dropout', record_dropout)
+            model.fit(X, y)
+        return batches, masks
+
+    first = fit(19)
+    assert first == fit(19)
+    different = fit(23)
+    for sequence, other in zip(first, different):
+        assert sequence != other
+        assert len(set(sequence)) > 1
+
+
+@pytest.mark.parametrize("shape", [(31, 9), (9, 31)])
+def test_local_lowrank_pca_matches_reference_projection(shape):
+    X = torch.randn(*shape, dtype=torch.float64, generator=torch.Generator().manual_seed(42))
+    with torch.random.fork_rng(devices=[]):
+        torch.default_generator.manual_seed(19)
+        U, S, V = torch.svd_lowrank(X, q=4, M=X.mean(0))
+    pca = TorchPCA(n_components=4, fit="lowrank")
+    before = snapshot()
+    with fit_random_generators(19):
+        scores = pca.fit_transform(X)
+    torch.testing.assert_close(scores @ pca.components_, (U * S) @ V.mT)
     assert_restored(before)

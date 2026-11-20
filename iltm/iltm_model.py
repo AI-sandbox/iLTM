@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from ._random import dropout, torch_generator
 from .utils import forward_linear_layer, Linear, TorchPCA, SimpleBatchNorm1dFixed
 
 logger = logging.getLogger(__name__)
@@ -115,8 +116,8 @@ class InitialTransformationBlock(nn.Module):
 
     def _apply_random_features(self, X):
         rf_size = self.rf_size
-        rf_linear = nn.Linear(X.shape[1], rf_size, bias=False)
-        nn.init.kaiming_normal_(rf_linear.weight, mode="fan_out", nonlinearity="relu")
+        rf_linear = nn.Linear(X.shape[1], rf_size, bias=False, device="meta").to_empty(device="cpu")
+        nn.init.kaiming_normal_(rf_linear.weight, mode="fan_out", nonlinearity="relu", generator=torch_generator())
         rf_linear.weight.requires_grad = False
         self.rf = nn.Sequential(rf_linear, nn.ReLU()).to(X.device)
         with torch.no_grad():
@@ -295,7 +296,7 @@ class HypernetworkBlock(nn.Module):
             if n % 2 == 1:
                 out = out + residual_connection
             out = F.relu(out)
-            out = F.dropout(out, p=self.hyper_dropout, training=training)
+            out = dropout(out, p=self.hyper_dropout, training=training)
 
             main_network.append(main_linear_layer)
 

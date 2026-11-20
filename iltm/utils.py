@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import os
 import math
 import time
-import random
 import torch
 import copy
 import contextlib
@@ -22,6 +20,8 @@ from sklearn.utils import resample
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 
+from ._random import dropout, numpy_random_state, torch_generator
+
 # Configure logging
 logger = logging.getLogger(__name__)
 
@@ -39,37 +39,6 @@ def sample_from_spec(rng: np.random.Generator, spec: dict[str, Any]) -> Any:
     if kind == "log_uniform":
         return float(np.exp(rng.uniform(np.log(spec["low"]), np.log(spec["high"]))))
     raise ValueError(f"Unknown hyperparameter type {kind!r}")
-
-
-@contextlib.contextmanager
-def preserve_random_state():
-    """Restore the caller's RNG states and hash-seed environment after a call."""
-    python_state = random.getstate()
-    numpy_state = np.random.get_state()
-    hash_seed = os.environ.get('PYTHONHASHSEED')
-    devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
-    try:
-        with torch.random.fork_rng(devices=devices):
-            yield
-    finally:
-        random.setstate(python_state)
-        np.random.set_state(numpy_state)
-        if hash_seed is None:
-            os.environ.pop('PYTHONHASHSEED', None)
-        else:
-            os.environ['PYTHONHASHSEED'] = hash_seed
-
-
-def seed_everything(seed: int):
-    random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.deterministic = True
 
 
 def fit_deadline_reached(fit_deadline: float | None) -> bool:
@@ -123,6 +92,33 @@ def svd_flip(u, v, u_based_decision=True):
     return u, v
 
 
+def _centered_lowrank_svd(X: Tensor, mean: Tensor, rank: int):
+    """Randomized SVD with two power iterations and a fit-local projection.
+
+    Apply the centering correction to each product to avoid allocating
+    another matrix the size of the expanded feature table.
+    """
+    wide = X.shape[0] < X.shape[1]
+
+    def multiply(basis):
+        return X @ basis - mean @ basis
+
+    def multiply_transposed(basis):
+        return X.mT @ basis - mean[:, None] * basis.sum(dim=0)
+
+    forward, transpose = (multiply_transposed, multiply) if wide else (multiply, multiply_transposed)
+    projection = torch.randn(
+        min(X.shape), rank, dtype=X.dtype, device=X.device, generator=torch_generator(X.device)
+    )
+    basis = torch.linalg.qr(forward(projection)).Q
+    for _ in range(2):
+        basis = torch.linalg.qr(transpose(basis)).Q
+        basis = torch.linalg.qr(forward(basis)).Q
+    U, S, Vt = torch.linalg.svd(transpose(basis).mT, full_matrices=False)
+    U = basis @ U
+    return (Vt.mT, S, U.mT) if wide else (U, S, Vt)
+
+
 class TorchPCA:
     def __init__(self, n_components=None, fit="reduced", svd_driver=None):
         self.n_components = n_components
@@ -145,8 +141,7 @@ class TorchPCA:
         elif self.fit == "reduced":
             U, S, Vt = torch.linalg.svd(X - self.mean_, full_matrices=False, driver=self.svd_driver)
         elif self.fit == "lowrank":
-            U, S, V = torch.svd_lowrank(X, q=self.n_components_, M=self.mean_)
-            Vt = V.mT  # Transpose V to get Vt
+            U, S, Vt = _centered_lowrank_svd(X, self.mean_, self.n_components_)
         else:
             raise ValueError(f"Unrecognized fit method: {self.fit}")
 
@@ -187,7 +182,7 @@ def sample_data(X: Tensor | dict, y: Tensor,
     if return_sampled_indices and to_meta_model:
         raise ValueError("to_meta_model must be False when returning sampled indices.")
     # For regression, stratification is not applicable; always use random sampling:
-    sampled_indices = torch.randperm(len(y))[:batch_size]
+    sampled_indices = torch.randperm(len(y), generator=torch_generator())[:batch_size]
     selection_indices = sampled_indices.to(y.device)
 
     if isinstance(X, dict):
@@ -228,7 +223,7 @@ def sample_data(X: Tensor | dict, y: Tensor,
         elif pca_sampling == 'bootstrap':
             logger.debug("Using bootstrap sampling to reach minimum samples for PCA.")
             additional_samples_needed = min_samples - y_sampled.shape[0]
-            bootstrap_indices = torch.randint(0, y_sampled.shape[0], (additional_samples_needed,))
+            bootstrap_indices = torch.randint(0, y_sampled.shape[0], (additional_samples_needed,), generator=torch_generator())
             if isinstance(X_sampled, dict):
                 X_sampled = {
                     'x_num': torch.cat([X_sampled['x_num'], X_sampled['x_num'][bootstrap_indices]], dim=0),
@@ -314,7 +309,7 @@ def forward_main_network(
         # activation + dropout on all but the last layer
         if n != len(main_network) - 1:
             x = F.relu(x)
-            x = F.dropout(x, p=finetuning_dropout, training=training_finetuning)
+            x = dropout(x, p=finetuning_dropout, training=training_finetuning)
     return x, intermediate_state
 
 
@@ -556,7 +551,7 @@ class PCAModule(nn.Module):
         self.pca_mean = (nn.Parameter(pca.mean_))
         self.input_features, self.output_features = pca.components_.shape
         self.pca_components = nn.Linear(
-            self.input_features, self.output_features, bias=False
+            self.input_features, self.output_features, bias=False, device="meta"
         )
         self.pca_components.weight = (nn.Parameter(pca.components_))
 
@@ -631,7 +626,7 @@ class MainNetworkTrainable(nn.Module):
         self.main_network = nn.ModuleList()
         for linear in main_network:  # linear is Linear object above (not nn.Linear)
             matrix, bias = linear.m, linear.b
-            linear_layer = nn.Linear(matrix.shape[0], matrix.shape[1])
+            linear_layer = nn.Linear(matrix.shape[0], matrix.shape[1], device="meta")
             linear_layer.weight = nn.Parameter(matrix.T)
             linear_layer.bias = nn.Parameter(bias)
             self.main_network.append(linear_layer)
@@ -904,7 +899,7 @@ def fine_tune_main_network(
             stratify_by = check_stratification(y_np, stratify=True, task_type='classification') if n_classes > 1 else None
             X_train, X_val, y_train, y_val, train_ids, _ = train_test_split(
                 X.cpu().numpy(), y_np, row_ids, test_size=finetuning_val_frac,
-                random_state=None, stratify=stratify_by,
+                random_state=numpy_random_state(), stratify=stratify_by,
             )
         else:
             X_train, y_train = X.cpu().numpy(), y.cpu().numpy()
@@ -919,7 +914,7 @@ def fine_tune_main_network(
     if finetuning_data == 'bootstrap':
         X_train, y_train, train_ids = resample(
             X_train, y_train, train_ids, replace=True,
-            n_samples=len(X_train), random_state=None,
+            n_samples=len(X_train), random_state=numpy_random_state(),
         )
         logger.debug("Using bootstrap sampling for fine-tuning.")
 
@@ -932,7 +927,7 @@ def fine_tune_main_network(
 
     # Optionally cap validation set size
     if X_val is not None and y_val is not None and val_max_samples is not None and len(X_val) > val_max_samples:
-        idx = torch.randperm(len(X_val))[:val_max_samples]
+        idx = torch.randperm(len(X_val), generator=torch_generator())[:val_max_samples]
         X_val = X_val[idx]
         y_val = y_val[idx]
 
@@ -946,7 +941,7 @@ def fine_tune_main_network(
         if finetuning_subset_max_samples is not None:
             n_target = min(n_target, int(finetuning_subset_max_samples))
         n_target = max(1, n_target)
-        return torch.randperm(len_train)[:n_target]
+        return torch.randperm(len_train, generator=torch_generator())[:n_target]
 
     # Utility to create loaders for this epoch
     train_context_positions = None
@@ -965,11 +960,11 @@ def fine_tune_main_network(
         # Only use pin_memory for CUDA devices to avoid deprecation warnings on CPU
         use_pin_memory = device.type == 'cuda'
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=use_pin_memory,
-                                  collate_fn=_keep_tensor_batch)
+                                  collate_fn=_keep_tensor_batch, generator=torch_generator())
         if X_val is not None and y_val is not None:
             val_dataset = _BatchedTensorDataset(X_val, y_val)
             val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=use_pin_memory,
-                                   collate_fn=_keep_tensor_batch)
+                                   collate_fn=_keep_tensor_batch, generator=torch_generator())
         else:
             val_loader = None
         return train_loader, val_loader, len(idx)
@@ -1050,7 +1045,7 @@ def fine_tune_main_network(
     if do_retrieval:
         max_ctxt = 65536
         if len(X_train) > max_ctxt:
-            idx_ctxt = torch.randperm(len(X_train))[:max_ctxt]
+            idx_ctxt = torch.randperm(len(X_train), generator=torch_generator())[:max_ctxt]
             X_ctxt_superset = X_train[idx_ctxt].to(device)
             y_ctxt_superset = y_train[idx_ctxt].to(device)
             context_ids_superset = train_ids[idx_ctxt].to(device)
