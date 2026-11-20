@@ -289,7 +289,7 @@ class _iLTMBase(BaseEstimator):
         tree_for_each_predictor: bool = True,
         tree_use_default_params: bool = False,
         tree_select_best_model: bool = True,
-        tree_use_external_eval_set: bool = False,
+        tree_use_external_eval_set: bool = True,
         concat_tree_with_orig_features: bool = True,
         tree_max_leaves: int | None = None,
         tree_gamma: float | None = 0.0,
@@ -2670,7 +2670,7 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         tree_for_each_predictor: bool = True,
         tree_use_default_params: bool = False,
         tree_select_best_model: bool = True,
-        tree_use_external_eval_set: bool = False,
+        tree_use_external_eval_set: bool = True,
         concat_tree_with_orig_features: bool = True,
         tree_max_leaves: int | None = None,
         tree_gamma: float | None = 0.0,
@@ -2740,6 +2740,8 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
             Target values for training.
         eval_set : tuple or None
             Optional validation set as a tuple (X_val, y_val).
+            Trees use it for early stopping by default. Set
+            ``tree_use_external_eval_set=False`` to use a separate tree validation split.
         fit_max_time : float or None
             Maximum time in seconds to allow for fitting. If None, no time
             limit is applied. Zero raises ``TimeoutError`` immediately;
@@ -3013,7 +3015,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         tree_for_each_predictor: bool = True,
         tree_use_default_params: bool = False,
         tree_select_best_model: bool = True,
-        tree_use_external_eval_set: bool = False,
+        tree_use_external_eval_set: bool = True,
         concat_tree_with_orig_features: bool = True,
         tree_max_leaves: int | None = None,
         tree_gamma: float | None = 0.0,
@@ -3086,6 +3088,8 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
             Target values for training.
         eval_set : tuple or None
             Optional validation set as a tuple (X_val, y_val).
+            Trees use it for early stopping by default. Set
+            ``tree_use_external_eval_set=False`` to use a separate tree validation split.
         fit_max_time : float or None
             Maximum time in seconds to allow for fitting. If None, no time
             limit is applied. Zero raises ``TimeoutError`` immediately;

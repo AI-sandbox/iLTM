@@ -9,22 +9,25 @@ from iltm import iLTMClassifier, iLTMRegressor
 from iltm.tree_embedding import TreeEmbedding
 
 
-def test_tree_internal_eval_is_default_and_routing_is_sklearn_configurable():
+def test_tree_external_eval_is_default_and_routing_is_sklearn_configurable():
     for model_cls in (iLTMClassifier, iLTMRegressor):
         default_model = model_cls(checkpoint=None, device="cpu")
-        external_model = model_cls(
+        internal_model = model_cls(
             checkpoint=None,
             device="cpu",
-            tree_use_external_eval_set=True,
+            tree_use_external_eval_set=False,
         )
 
-        assert default_model.tree_use_external_eval_set is False
-        assert default_model.get_params()["tree_use_external_eval_set"] is False
-        assert external_model.tree_use_external_eval_set is True
-        assert external_model.get_params()["tree_use_external_eval_set"] is True
+        assert default_model.get_params()["tree_use_external_eval_set"] is True
+        assert internal_model.get_params()["tree_use_external_eval_set"] is False
 
 
-def test_external_eval_is_not_routed_to_tree_when_disabled(monkeypatch):
+@pytest.mark.parametrize("tree_for_each_predictor", [False, True])
+@pytest.mark.parametrize(
+    ("options", "has_eval_set", "uses_external_eval"),
+    [({}, True, True), ({"tree_use_external_eval_set": False}, True, False), ({}, False, False)],
+)
+def test_tree_validation_routing(monkeypatch, tree_for_each_predictor, options, has_eval_set, uses_external_eval):
     captured = {}
 
     class RecordingTreeEmbedding:
@@ -51,11 +54,11 @@ def test_external_eval_is_not_routed_to_tree_when_disabled(monkeypatch):
         device="cpu",
         n_ensemble=1,
         tree_embedding=True,
-        tree_for_each_predictor=False,
+        tree_for_each_predictor=tree_for_each_predictor,
         tree_data_split="all",
         tree_select_best_model=True,
-        tree_use_external_eval_set=False,
         auto_stop_on_low_cpu_memory=False,
+        **options,
     )
     model.checkpoint = "unused"
     monkeypatch.setattr(model, "_auto_tune_for_memory", lambda: None)
@@ -63,7 +66,7 @@ def test_external_eval_is_not_routed_to_tree_when_disabled(monkeypatch):
     monkeypatch.setattr(
         model,
         "_preprocess_fitting_data",
-        lambda X, y, is_classification: (
+        lambda X, y, **kwargs: (
             np.asarray(X, dtype=np.float32),
             np.asarray(y, dtype=np.float32),
             object(),
@@ -83,11 +86,11 @@ def test_external_eval_is_not_routed_to_tree_when_disabled(monkeypatch):
 
     X = np.arange(24, dtype=np.float32).reshape(12, 2)
     y = np.linspace(-1.0, 1.0, 12, dtype=np.float32)
-    external_eval_set = (X[:4], y[:4])
+    external_eval_set = (X[:4], y[:4]) if has_eval_set else None
     model._fit_common(X, y, eval_set=external_eval_set, n_outputs=1)
 
     assert captured["select_best_model"] is True
-    assert captured["tree_eval_set"] is None
+    assert captured["tree_eval_set"] is (external_eval_set if uses_external_eval else None)
 
 
 @pytest.mark.parametrize("tree_model", ["XGBoost_hist", "CatBoost"])
