@@ -1935,10 +1935,10 @@ def select_top_correlated_features(correlations: np.ndarray, num_features: int) 
 
 def detect_object_string_columns(X: np.ndarray | pd.DataFrame, cat_features: list[int] | None = None) -> list[int]:
     """
-    Detect columns with dtype 'object' that contain string values and should be treated as categorical.
+    Detect object and string columns that should be treated as categorical.
     
-    This function identifies columns that have object dtype and contain string values,
-    which should be treated as categorical but weren't explicitly marked as such.
+    This function identifies columns with object or pandas string dtype whose
+    observed values are strings and which weren't explicitly marked as categorical.
     It avoids duplicates with already-identified categorical features.
     
     Parameters
@@ -1981,7 +1981,7 @@ def detect_object_string_columns(X: np.ndarray | pd.DataFrame, cat_features: lis
         
         col_data = df.iloc[:, col_idx]
         
-        if col_data.dtype == 'object':
+        if col_data.dtype == 'object' or isinstance(col_data.dtype, pd.StringDtype):
             non_null_values = col_data.dropna()
             if len(non_null_values) == 0:
                 continue
@@ -1991,6 +1991,6 @@ def detect_object_string_columns(X: np.ndarray | pd.DataFrame, cat_features: lis
             
             if all(isinstance(val, str) for val in sample_values):
                 detected_cat_features.add(col_idx)
-                logger.info(f"Detected object column with string values at index {col_idx} (column '{col_name}'). Adding to categorical features.")
+                logger.info(f"Detected string values at index {col_idx} (column '{col_name}'). Adding to categorical features.")
 
     return sorted(list(detected_cat_features))

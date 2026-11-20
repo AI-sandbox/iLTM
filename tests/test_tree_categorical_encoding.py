@@ -2,6 +2,17 @@ import numpy as np
 import pandas as pd
 
 from iltm.tree_embedding import TreeEmbedding
+from iltm.utils import detect_object_string_columns
+
+
+def test_categorical_detection_handles_pandas_string_dtype():
+    X = pd.DataFrame({
+        "string": pd.Series(["alpha", "beta", None], dtype="string"),
+        "object": pd.Series(["alpha", "beta", None], dtype=object),
+        "mixed": pd.Series(["alpha", 1, None], dtype=object),
+    })
+
+    assert detect_object_string_columns(X) == [0, 1]
 
 
 def test_tree_validation_uses_training_categorical_encoder():
