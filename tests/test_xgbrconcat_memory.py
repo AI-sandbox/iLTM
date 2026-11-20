@@ -90,16 +90,22 @@ def test_xgbrconcat_fitting_output_matches_legacy_object_concat():
 
 
 @pytest.mark.parametrize("tree_for_each_predictor", [False, True])
-def test_wide_tree_concat_remaps_categories_for_fit_and_prediction(monkeypatch, tree_for_each_predictor):
+@pytest.mark.parametrize(
+    ("preprocessing", "concat"),
+    [("realmlp_td_s_v0", True), ("minimal", True), ("realmlp_td_s_v0", False)],
+)
+def test_tree_preprocessing_uses_categories_from_retained_columns(
+    monkeypatch, tree_for_each_predictor, preprocessing, concat,
+):
     X = pd.DataFrame(np.random.default_rng(19).normal(size=(8, 6150)).astype(np.float32))
     X[1] = [0, 1] * 4
-    X[6148] = pd.Categorical(["a", "b"] * 4)
+    X[6148] = pd.Series(["a", "b", pd.NA, "b"] * 2, dtype="string")
     X[6149] = pd.Categorical(["c", "d"] * 4)
     y = np.arange(len(X)) % 2
     original_categories = [1, 6148, 6149]
     model = iLTMClassifier(
         checkpoint=None, device="cpu", cat_features=original_categories,
-        tree_embedding=True, concat_tree_with_orig_features=True,
+        preprocessing=preprocessing, tree_embedding=True, concat_tree_with_orig_features=concat,
         tree_for_each_predictor=tree_for_each_predictor, tree_data_split="all",
         n_ensemble=2 if tree_for_each_predictor else 1,
         retrieval_alpha_adaptive=False, auto_stop_on_low_cpu_memory=False,
@@ -122,7 +128,7 @@ def test_wide_tree_concat_remaps_categories_for_fit_and_prediction(monkeypatch, 
 
     def generate_predictor(X, y, *, X_val, **kwargs):
         fit_inputs.append(X_val)
-        torch.testing.assert_close(X_val, X[: len(X_val)])
+        torch.testing.assert_close(X_val, X[: len(X_val)].float())
         return {"timed_out": False}
 
     def forward(predictor, X, *, n_outputs, **kwargs):
@@ -139,11 +145,36 @@ def test_wide_tree_concat_remaps_categories_for_fit_and_prediction(monkeypatch, 
 
     model.fit(X, y, eval_set=(X.iloc[:4], y[:4]))
     expected = [[6143], [1, 6143]] if tree_for_each_predictor else [[6143]]
-    assert [prep["pipeline"].cat_features for prep in model.preprocessors_] == expected
+    if not concat:
+        expected = [[] for _ in expected]
+    for prep, indices in zip(model.preprocessors_, expected, strict=True):
+        actual = prep["cat_features"] if preprocessing == "minimal" else prep["pipeline"].cat_features
+        assert actual == indices
     assert model.cat_features == original_categories
     assert model.predict_proba(X.iloc[:4]).shape == (4, 2)
     for predicted, fitted in zip(predict_inputs, fit_inputs, strict=True):
         torch.testing.assert_close(predicted, fitted)
+
+
+def test_minimal_concat_keeps_all_missing_original_columns():
+    model = iLTMClassifier(checkpoint=None, device="cpu", preprocessing="minimal")
+    original = pd.DataFrame({
+        "category": pd.Series([pd.NA] * 3, dtype="string"),
+        "value": pd.Series([pd.NA] * 3, dtype="Float64"),
+    })
+    leaves = np.array([[1], [0], [1]], dtype=np.int8)
+    inputs = model._concatenate_original_and_tree_features(original, leaves)
+    fitted, _, prep = model._preprocess_fitting_data(
+        inputs, np.array([1, 0, 1]), is_classification=True, cat_features=[0],
+    )
+
+    held_out = inputs.copy()
+    held_out.iloc[1, :2] = ["unseen", 7.0]
+    predicted = model._preprocess_test_data(held_out, prep).numpy()
+    assert predicted.shape == fitted.shape == (3, 3)
+    np.testing.assert_allclose(predicted[[0, 2]], fitted[[0, 2]], rtol=1e-6)
+    assert predicted[1, 1] == 7.0
+    assert np.isfinite(predicted).all()
 
 
 def test_predict_once_uses_dtype_preserving_tree_concat(monkeypatch):

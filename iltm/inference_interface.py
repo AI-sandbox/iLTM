@@ -1171,6 +1171,14 @@ class _iLTMBase(BaseEstimator):
             ]
         return selected
 
+    @staticmethod
+    def _minimal_numeric_columns(x: np.ndarray, indices: np.ndarray) -> np.ndarray:
+        values = x[:, indices]
+        if values.dtype == object:
+            # Nullable pandas numbers can arrive as pd.NA in a mixed-type table.
+            values[pd.isna(values)] = np.nan
+        return values
+
     def _preprocess_fitting_data(
         self,
         x: np.ndarray | pd.DataFrame,
@@ -1197,27 +1205,26 @@ class _iLTMBase(BaseEstimator):
             x = np.array(x)
             y = np.array(y)
 
-            if not self.tree_embedding:
-                preprocessing_objects['cat_features'] = cat_features if cat_features is not None else []
-            else:
-                preprocessing_objects['cat_features'] = []
+            preprocessing_objects['cat_features'] = cat_features
 
-            preprocessing_objects['num_imputer'] = SimpleImputer(missing_values=np.nan, strategy="mean")
+            preprocessing_objects['num_imputer'] = SimpleImputer(strategy="mean", keep_empty_features=True)
             if len(x.shape) == 2:
                 self._all_feature_idxs = np.arange(x.shape[1])
             else:
                 raise ValueError("Reshape your data")
 
-            preprocessing_objects['numerical_feature_idxs'] = np.setdiff1d(self._all_feature_idxs, preprocessing_objects['cat_features'])
-            if len(preprocessing_objects['numerical_feature_idxs']) > 0:
-                preprocessing_objects['num_imputer'].fit(x[:, preprocessing_objects['numerical_feature_idxs']])
-                x[:, preprocessing_objects['numerical_feature_idxs']] = preprocessing_objects['num_imputer'].transform(
-                    x[:, preprocessing_objects['numerical_feature_idxs']]
+            numeric_idxs = np.setdiff1d(self._all_feature_idxs, cat_features)
+            preprocessing_objects['numerical_feature_idxs'] = numeric_idxs
+            if len(numeric_idxs) > 0:
+                x[:, numeric_idxs] = preprocessing_objects['num_imputer'].fit_transform(
+                    self._minimal_numeric_columns(x, numeric_idxs)
                 )
-                logger.debug(f"Len numerical features: {len(preprocessing_objects['numerical_feature_idxs'])}")
+                logger.debug(f"Len numerical features: {len(numeric_idxs)}")
 
             if len(preprocessing_objects['cat_features']) > 0:
-                preprocessing_objects['cat_imputer'] = SimpleImputer(missing_values=np.nan, strategy="most_frequent")
+                preprocessing_objects['cat_imputer'] = SimpleImputer(
+                    missing_values=pd.NA, strategy="most_frequent", keep_empty_features=True,
+                )
                 preprocessing_objects['cat_imputer'].fit(x[:, preprocessing_objects['cat_features']])
                 x[:, preprocessing_objects['cat_features']] = preprocessing_objects['cat_imputer'].transform(
                     x[:, preprocessing_objects['cat_features']]
@@ -1358,15 +1365,14 @@ class _iLTMBase(BaseEstimator):
         logger.debug(f"Preprocessing test data x_test {np.shape(x_test)} with type: {self.preprocessing}")
         if not isinstance(x_test, (np.ndarray, pd.DataFrame)):
             x_test = check_array(x_test)
-        if self.preprocessing != 'realmlp_td_s_v0':
-            x_test = np.array(x_test)
-
         if self.preprocessing == 'minimal':
+            x_test = np.array(x_test)
             if len(x_test.shape) == 1:
                 raise ValueError("Reshape your data")
-            if 'numerical_feature_idxs' in preprocessing_objects and len(preprocessing_objects['numerical_feature_idxs']) > 0:
-                x_test[:, preprocessing_objects['numerical_feature_idxs']] = preprocessing_objects['num_imputer'].transform(
-                    x_test[:, preprocessing_objects['numerical_feature_idxs']]
+            numeric_idxs = preprocessing_objects.get('numerical_feature_idxs')
+            if numeric_idxs is not None and len(numeric_idxs) > 0:
+                x_test[:, numeric_idxs] = preprocessing_objects['num_imputer'].transform(
+                    self._minimal_numeric_columns(x_test, numeric_idxs)
                 )
 
             if 'cat_imputer' in preprocessing_objects:
@@ -2040,7 +2046,7 @@ class _iLTMBase(BaseEstimator):
         tree_eval_set = eval_set if self.tree_use_external_eval_set else None
 
         # Single tree path
-        fit_cat_features = None
+        fit_cat_features = self.cat_features_
         if self.tree_embedding and not self.tree_for_each_predictor:
             X_tree, y_tree, X_for_nn, y_for_nn = self._split_data_tree_embedding(
                 X_original, y_proc, random_state=self.seed
@@ -2086,6 +2092,7 @@ class _iLTMBase(BaseEstimator):
             else:
                 X_work = X_emb_train
                 X_val_work = X_emb_val
+                fit_cat_features = []
             y_work = y_for_nn
         else:
             X_work, y_work = X_original, y_proc
@@ -2200,7 +2207,7 @@ class _iLTMBase(BaseEstimator):
                 self.tree_embedding and self.tree_for_each_predictor
             )
             if per_predictor_preprocessing:
-                fit_cat_features = None
+                fit_cat_features = self.cat_features_
                 predictor_tree_embedding = (
                     mixed_config["tree_embedding"]
                     if mixed_config is not None
@@ -2269,6 +2276,7 @@ class _iLTMBase(BaseEstimator):
                     else:
                         X_fit = X_emb_tr
                         X_val_fit = X_emb_val
+                        fit_cat_features = []
                 else:
                     X_fit = X_original
                     y_for_nn = y_proc
