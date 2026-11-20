@@ -172,3 +172,33 @@ def test_checkpoint_mix_uses_predictor_specific_inference_path(monkeypatch):
 
     assert seen_shapes == [(3, 4), (3, 2)]
     torch.testing.assert_close(outputs, torch.full((3, 2), 2.0))
+
+
+def test_checkpoint_mix_hard_voting_with_tree_free_member(monkeypatch):
+    monkeypatch.setattr(inference_interface, "resolve_model_checkpoint", _checkpoint_config)
+    estimator = iLTMClassifier(
+        checkpoint_mix=("cb", "xgb", "rtr"), n_ensemble=3, device="cpu", voting="hard",
+    )
+    estimator._fit_succeeded = True
+    estimator.n_outputs_ = 2
+    estimator.classes_ = np.array(["a", "b"])
+    estimator.predictor_configs_ = estimator._checkpoint_mix_configs.copy()
+    tree = SimpleNamespace(transform=lambda X: np.ones((len(X), 1), dtype=np.float32))
+    estimator.tr_ = [tree, tree, None]
+    estimator.preprocessors_ = [{"width": 3}, {"width": 3}, {"width": 2}]
+    estimator.predictors_ = [{"score": 0.1}, {"score": 0.1}, {"score": -10.0}]
+    estimator.inference_chunk_rows = 2
+
+    def preprocess(X, preprocessor):
+        assert X.shape[1] == preprocessor["width"]
+        return torch.as_tensor(np.asarray(X), dtype=torch.float32)
+
+    def forward(predictor, X, **kwargs):
+        return torch.tensor([0.0, predictor["score"]]).expand(len(X), -1)
+
+    monkeypatch.setattr(estimator, "_preprocess_test_data", preprocess)
+    monkeypatch.setattr(estimator, "_forward_pass_predictor", forward)
+    X = np.arange(6, dtype=np.float32).reshape(3, 2)
+
+    np.testing.assert_array_equal(estimator.predict(X), ["b", "b", "b"])
+    np.testing.assert_array_equal(estimator.predict_proba(X).argmax(axis=1), [0, 0, 0])

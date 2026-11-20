@@ -2426,6 +2426,7 @@ class _iLTMBase(BaseEstimator):
         n_outputs: int,
         softmax_per_predictor: bool = False,
         return_retrieval_components: bool = False,
+        hard_voting: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         check_is_fitted(self)
 
@@ -2508,7 +2509,9 @@ class _iLTMBase(BaseEstimator):
                             outs_chunks.append(main_out)
                             retrieval_outs_chunks.append(retrieval_out)
                         else:
-                            if softmax_per_predictor:
+                            if hard_voting:
+                                out = out.argmax(dim=1)
+                            elif softmax_per_predictor:
                                 out = F.softmax(out, dim=1)
                             outs_chunks.append(out)
                 finally:
@@ -2527,6 +2530,8 @@ class _iLTMBase(BaseEstimator):
                 )  # type: ignore[arg-type]
                 if return_retrieval_components:
                     outputs, retrieval_outputs = outputs
+                elif hard_voting:
+                    outputs = outputs.argmax(dim=1)
                 elif softmax_per_predictor:
                     outputs = F.softmax(outputs, dim=1)
 
@@ -2537,6 +2542,8 @@ class _iLTMBase(BaseEstimator):
         yhats_stacked = torch.stack(yhats)
         if return_retrieval_components:
             return yhats_stacked, torch.stack(retrieval_yhats)
+        if hard_voting:
+            return yhats_stacked.mode(dim=0).values
         return torch.mean(yhats_stacked, dim=0)
 
     def _fit_adaptive_retrieval_alpha(
@@ -3282,61 +3289,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
             return self.classes_[np.argmax(outputs, axis=1)]
         elif self.voting == 'hard':
             check_is_fitted(self)
-
-            # Preprocess once if possible
-            preprocessed_once: Optional[Tensor] = None
-            if not (self.tree_embedding and self.tree_for_each_predictor):
-                preprocessed_once = self._preprocess_for_predict_once(X)
-
-            votes: List[Tensor] = []
-            for i, predictor in enumerate(self.predictors_):
-                if self.tree_embedding and self.tree_for_each_predictor:
-                    n_samples = X.shape[0] if isinstance(X, np.ndarray) else len(X)
-                    try:
-                        chunk_rows = int(self.inference_chunk_rows)
-                    except Exception:
-                        chunk_rows = 10000
-                    pred_labels_chunks: List[Tensor] = []
-                    retrieval_context_cache: dict[str, tuple[Tensor, Tensor]] = {}
-                    try:
-                        predictor = self._move_predictor_to_device(
-                            predictor,
-                            device=self.device,
-                        )
-                        for start in range(0, n_samples, chunk_rows):
-                            end = min(start + chunk_rows, n_samples)
-                            X_batch_orig = X.iloc[start:end] if isinstance(X, pd.DataFrame) else X[start:end]
-                            X_emb = self.tr_[i].transform(X_batch_orig)
-                            if self.concat_tree_with_orig_features:
-                                X_base = self._select_original_features_for_tree(
-                                    self.tr_[i],
-                                    X_batch_orig,
-                                )
-                                X_batch = self._concatenate_original_and_tree_features(
-                                    X_base, X_emb
-                                )
-                            else:
-                                X_batch = X_emb
-                            X_tensor = self._preprocess_test_data(X_batch, self.preprocessors_[i])
-                            logits = self._forward_pass_predictor(
-                                predictor,
-                                X_tensor,
-                                n_outputs=self.n_outputs_,
-                                manage_predictor_device=False,
-                                retrieval_context_cache=retrieval_context_cache,
-                            )
-                            pred_labels_chunks.append(torch.argmax(logits, dim=1))
-                    finally:
-                        retrieval_context_cache.clear()
-                        self._move_predictor_to_cpu(predictor)
-                    pred_labels = torch.cat(pred_labels_chunks, dim=0)
-                else:
-                    logits = self._forward_pass_predictor(predictor, preprocessed_once, n_outputs=self.n_outputs_)  # type: ignore[arg-type]
-                    pred_labels = torch.argmax(logits, dim=1)
-                votes.append(pred_labels.unsqueeze(0))
-
-            votes_tensor = torch.cat(votes, dim=0)
-            majority, _ = votes_tensor.mode(dim=0)
+            majority = self._predict_ensemble(X, n_outputs=self.n_outputs_, hard_voting=True)
             return self.classes_[majority.cpu().numpy()]
         else:
             raise ValueError("Invalid voting method specified. Choose 'soft' or 'hard'.")
