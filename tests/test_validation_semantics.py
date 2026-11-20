@@ -1,7 +1,39 @@
 import numpy as np
 import pandas as pd
+import pytest
+import torch
 
 from iltm import iLTMClassifier
+
+
+@pytest.mark.parametrize("voting", ["soft", "hard"])
+def test_single_class_fit_predicts_the_observed_label(tmp_path, voting):
+    checkpoint = tmp_path / "cbrconcat.pth"
+    checkpoint.touch()
+    classifier = iLTMClassifier(checkpoint=str(checkpoint), device="cpu", voting=voting)
+    X = pd.DataFrame({"category": ["a", "b", "a"], "number": [1.0, np.nan, 0.0]})
+
+    assert classifier.fit(X, ["rare"] * len(X), eval_set=(X, ["common"] * len(X))) is classifier
+    np.testing.assert_array_equal(classifier.classes_, ["rare"])
+    np.testing.assert_array_equal(classifier.predict(X), ["rare"] * len(X))
+    np.testing.assert_array_equal(classifier.predict_proba(X), np.ones((len(X), 1)))
+    assert classifier.n_ensemble_ == 0
+
+    with pytest.raises(ValueError, match="2 features"):
+        classifier.predict(X[["category"]])
+
+
+def test_single_class_state_is_cleared_on_refit(monkeypatch):
+    classifier = iLTMClassifier(checkpoint=None, device="cpu", retrieval_alpha_adaptive=False)
+    X = np.eye(2)
+    classifier.fit(X, [7, 7])
+
+    monkeypatch.setattr(classifier, "_fit_common", lambda *args, **kwargs: classifier)
+    monkeypatch.setattr(classifier, "_predict_ensemble", lambda *args, **kwargs: torch.eye(2))
+    classifier.fit(X, [7, 9])
+
+    np.testing.assert_array_equal(classifier.predict(X), [7, 9])
+    np.testing.assert_array_equal(classifier.predict_proba(X), np.eye(2))
 
 
 def test_classifier_eval_labels_use_training_class_indices(monkeypatch):

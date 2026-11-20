@@ -20,7 +20,7 @@ from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.base import BaseEstimator, RegressorMixin, ClassifierMixin
-from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
+from sklearn.utils.validation import check_X_y, check_array, check_consistent_length, check_is_fitted
 from sklearn.utils.multiclass import check_classification_targets
 from sklearn.utils import column_or_1d, resample
 from sklearn.impute import SimpleImputer
@@ -810,6 +810,7 @@ class _iLTMBase(BaseEstimator):
         self.predictor_configs_ = []
         self.tr_ = None
         self.__dict__.pop("cat_features_", None)
+        self.__dict__.pop("_constant_n_features_", None)
         self.__dict__.pop("_prediction_calibration_slope_", None)
         self.__dict__.pop("_prediction_calibration_intercept_", None)
         self.__dict__.pop("retrieval_alpha_", None)
@@ -3158,6 +3159,8 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         """
         Fit the iLTM classifier model.
 
+        If training contains a single class, fit a constant classifier.
+
         Parameters
         ----------
         X : np.ndarray or pd.DataFrame
@@ -3208,6 +3211,19 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         self.classes_, y_proc = np.unique(y, return_inverse=True)
         self.n_classes_ = len(self.classes_)
         self.n_outputs_ = self.n_classes_
+
+        if self.n_classes_ == 1:
+            check_consistent_length(X, column_or_1d(y))
+            shape = np.shape(X)
+            if len(shape) != 2 or shape[1] == 0:
+                raise ValueError("X must be two-dimensional with at least one feature.")
+            if pd.isna(self.classes_[0]):
+                raise ValueError("The training class label cannot be missing.")
+            if fit_deadline_reached(fit_deadline):
+                raise TimeoutError("iLTM fit time budget expired before the constant classifier could be fitted.")
+            self._constant_n_features_ = shape[1]
+            self._fit_succeeded = True
+            return self
 
         # Align validation labels to the class indices learned from training.
         if eval_set is not None:
@@ -3281,6 +3297,11 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
     @_with_torch_settings
     def predict_proba(self, X: np.ndarray | pd.DataFrame) -> np.ndarray:
         check_is_fitted(self)
+        if hasattr(self, "_constant_n_features_"):
+            shape = np.shape(X)
+            if len(shape) != 2 or shape[1] != self._constant_n_features_:
+                raise ValueError(f"X must be two-dimensional with {self._constant_n_features_} features.")
+            return np.ones((shape[0], 1), dtype=np.float32)
         probs = self._predict_ensemble(
             X, n_outputs=self.n_outputs_, softmax_per_predictor=True
         )
@@ -3288,7 +3309,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
 
     @_with_torch_settings
     def predict(self, X: np.ndarray | pd.DataFrame) -> np.ndarray:
-        if self.voting == 'soft':
+        if self.voting == 'soft' or (self.voting == 'hard' and hasattr(self, "_constant_n_features_")):
             outputs = self.predict_proba(X)
             return self.classes_[np.argmax(outputs, axis=1)]
         elif self.voting == 'hard':
