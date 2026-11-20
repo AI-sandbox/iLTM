@@ -12,15 +12,30 @@ from iltm.model_checkpoints import (
 
 class TestCheckpointResolution:
     
-    def test_resolve_known_checkpoint_names(self):
+    def test_resolve_known_checkpoint_names(self, monkeypatch, tmp_path):
+        calls = []
+
+        def download(*, repo_id, filename, revision, local_dir):
+            calls.append((repo_id, filename, revision))
+            path = Path(local_dir) / filename
+            path.touch()
+            return str(path)
+
+        monkeypatch.setenv("ILTM_CKPT_DIR", str(tmp_path))
+        monkeypatch.setattr("iltm.model_checkpoints.hf_hub_download", download)
         known_checkpoints = [
             "xgbrconcat", "cbrconcat"
         ]
         
         for name in known_checkpoints:
             config = get_model_checkpoint_config(name)
-            assert 'checkpoint' in config
-            assert isinstance(config['checkpoint'], str)
+            assert config["checkpoint"] == str(tmp_path / f"{name}.pth")
+            assert get_model_checkpoint_config(name) == config
+
+        assert calls == [
+            ("dbonet/iLTM", f"{name}.pth", "ef783ec2a246686ad4bd43f35b590c196e70a1ba")
+            for name in known_checkpoints
+        ]
     
     def test_resolve_unknown_checkpoint_name(self):
         with pytest.raises(ValueError, match="Unknown model name suffix"):

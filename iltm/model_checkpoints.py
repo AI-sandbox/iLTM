@@ -10,6 +10,8 @@ from .hyperparameter_configs import _CHECKPOINT_MIXES
 
 CKPT_DIR_ENV = "ILTM_CKPT_DIR"
 HF_REPO_ID = "dbonet/iLTM"
+# Keep the released weights pinned
+HF_REVISION = "ef783ec2a246686ad4bd43f35b590c196e70a1ba"
 AVAILABLE_CHECKPOINTS = [
     "xgbrconcat", "cbrconcat", "r128bn", "rnobn", "xgb", "catb", "rtr", "rtrcb",
 ]
@@ -99,6 +101,7 @@ def _ensure_checkpoint(repo_id: str, filename: str, ckpt_dir: str) -> str:
         path = hf_hub_download(
             repo_id=repo_id,
             filename=filename,
+            revision=HF_REVISION,
             local_dir=ckpt_dir,
         )
         return path
@@ -120,6 +123,7 @@ def _ensure_checkpoint(repo_id: str, filename: str, ckpt_dir: str) -> str:
         path = hf_hub_download(
             repo_id=repo_id,
             filename=filename,
+            revision=HF_REVISION,
             local_dir=ckpt_dir,
         )
         return path
