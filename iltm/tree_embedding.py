@@ -260,6 +260,43 @@ class TreeEmbedding:
 
         return X
 
+    def _split_internal_validation(
+        self, X: pd.DataFrame, y: np.ndarray | pd.Series,
+    ) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.Series, pd.Series | None]:
+        """Keep every observed class in training when holding out rows for a tree."""
+        assert 0 < self.eval_size < 1, "eval_size must be between 0 and 1."
+        y = pd.Series(y, index=X.index)
+        if self.task_type != "classification":
+            X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=self.eval_size, random_state=self.seed)
+            return X_train, X_val, y_train, y_val
+
+        repeated = y.duplicated(keep=False).to_numpy()
+        eligible = np.flatnonzero(repeated)
+        if eligible.size == 0:
+            logger.info("Skipping tree early stopping because each class has only one training row.")
+            return X, None, y, None
+
+        labels = y.iloc[eligible]
+        n_classes = labels.nunique()
+        requested = int(np.ceil(self.eval_size * len(eligible)))
+        n_val = min(max(requested, n_classes), len(eligible) - n_classes)
+        if n_val != requested:
+            logger.warning(
+                "Adjusting the tree validation size from %d to %d of %d eligible rows for stratification.",
+                requested, n_val, len(eligible),
+            )
+        train_idx, val_idx = train_test_split(eligible, test_size=n_val, random_state=self.seed, stratify=labels)
+        if n_val > len(eligible) // 2:
+            # A large stratified holdout can round a minority class down to zero training rows.
+            # Swap one validation row per missing class with a spare training row.
+            train_labels, val_labels = y.iloc[train_idx], y.iloc[val_idx]
+            missing = (~val_labels.isin(train_labels) & ~val_labels.duplicated()).to_numpy()
+            spare = np.flatnonzero(train_labels.duplicated())[:missing.sum()]
+            train_idx[spare], val_idx[missing] = val_idx[missing], train_idx[spare]
+
+        train_idx = np.concatenate([train_idx, np.flatnonzero(~repeated)])
+        return X.iloc[train_idx], X.iloc[val_idx], y.iloc[train_idx], y.iloc[val_idx]
+
     def _fit_model(self, X: pd.DataFrame, y: np.ndarray | pd.Series, eval_set: tuple = None) -> None:
         """
         Fits the tree-based model based on the specified type.
@@ -320,75 +357,9 @@ class TreeEmbedding:
             self.model.fit(X, y)  # Doesn't support eval_set
             return
 
-        # Prepare eval_set if requested
         if self.select_best_model:
-            # If select_best_model is True, use eval_size from X for validation if eval_set is None
             if eval_set is None:
-                assert 0 < self.eval_size < 1, "eval_size must be between 0 and 1."
-
-                if self.task_type == 'classification':
-                    # Convert y to a pandas Series with alignment to X
-                    if not isinstance(y, pd.Series):
-                        y_series = pd.Series(y, index=X.index)
-                    else:
-                        y_series = y.reindex(X.index)
-
-                    # Identify rare classes
-                    class_counts = y_series.value_counts()
-                    rare_classes = class_counts[class_counts < 2].index.tolist()
-
-                    # Separate rare instances to always include in training
-                    is_rare = y_series.isin(rare_classes)
-                    X_rare = X[is_rare]
-                    y_rare = y_series[is_rare]
-
-                    # Data without the rare classes for stratified split
-                    X_rest = X[~is_rare]
-                    y_rest = y_series[~is_rare]
-
-                    # Check if stratification is possible on the remaining data
-                    if not y_rest.empty and y_rest.nunique() > 0:
-                        # Calculate the fraction required to have at least one sample per class
-                        required_fraction = y_rest.nunique() / len(y_rest)
-                        # Adjust eval_size if necessary
-                        adjusted_eval_size = max(self.eval_size, required_fraction)
-                        if adjusted_eval_size != self.eval_size:
-                            logger.warning(f"eval_size {self.eval_size} is too low for stratification; adjusting to {adjusted_eval_size}.")
-                        X_train_rest, X_val, y_train_rest, y_val = train_test_split(
-                            X_rest, y_rest,
-                            test_size=adjusted_eval_size,  # self.eval_size,
-                            random_state=self.seed,
-                            stratify=y_rest
-                        )
-                    else:
-                        # If no data remains for stratification, fall back to a simple split
-                        X_train_rest, X_val, y_train_rest, y_val = train_test_split(
-                            X, y_series,
-                            test_size=self.eval_size,
-                            random_state=self.seed
-                        )
-                        X_val, y_val = X_val.copy(), y_val.copy()  # Ensure independence
-
-                    # Combine the rare class instances with the stratified training set
-                    X_train = pd.concat([X_train_rest, X_rare])
-                    y_train = pd.concat([y_train_rest, y_rare])
-                else:
-                    # Regression: simple random split without stratification
-                    if not isinstance(y, pd.Series):
-                        y_series = pd.Series(y, index=X.index)
-                    else:
-                        y_series = y.reindex(X.index)
-
-                    X_train, X_val, y_train, y_val = train_test_split(
-                        X,
-                        y_series,
-                        test_size=self.eval_size,
-                        random_state=self.seed,
-                    )
-
-                # Create eval_set
-                eval_set = (X_val, y_val)
-                X, y = X_train, y_train
+                X, X_val, y, y_val = self._split_internal_validation(X, y)
             else:
                 X_val, y_val = eval_set
                 X_val = self._handle_categorical_features(X_val, fit=False)
@@ -455,7 +426,7 @@ class TreeEmbedding:
                         dtrain=dtrain,
                         num_boost_round=num_rounds,
                         evals=evals,
-                        early_stopping_rounds=100 if self.select_best_model else None,
+                        early_stopping_rounds=100 if dval is not None else None,
                         verbose_eval=0
                     )
                     break

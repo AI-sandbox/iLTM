@@ -4,8 +4,7 @@ import pytest
 import torch
 from sklearn.model_selection import train_test_split
 
-import iltm.inference_interface as inference_interface
-from iltm import iLTMClassifier, iLTMRegressor
+from iltm import iLTMClassifier, iLTMRegressor, inference_interface, tree_embedding
 from iltm.tree_embedding import TreeEmbedding
 
 
@@ -133,3 +132,53 @@ def test_internal_eval_stops_early_and_limits_leaf_embeddings(tree_model):
     assert 0 < best_iteration < trained_iterations - 1
     assert trained_iterations < tree.n_estimators
     assert leaves.shape == (len(X), best_iteration + 1)
+
+
+@pytest.mark.parametrize("tree_model", ["XGBoost_hist", "CatBoost"])
+@pytest.mark.parametrize(
+    ("labels", "eval_size", "n_validation", "external"),
+    [
+        pytest.param([0, 1, 2, 3], 0.2, 0, False, id="all-singletons"),
+        pytest.param([0, 0, 1, 2], 0.2, 1, False, id="one-repeat"),
+        pytest.param([0] * 18 + [1, 1, 2], 0.99, 18, False, id="large-holdout"),
+        pytest.param([0, 1, 2, 3], 0.2, 4, True, id="external-holdout"),
+    ],
+)
+def test_classification_holdout_keeps_training_classes_and_disjoint_rows(
+    monkeypatch, tree_model, labels, eval_size, n_validation, external,
+):
+    # Record which labeled rows reach the real backend. Row identity is independent of the pandas index.
+    batches = []
+    backend, name = (tree_embedding.xgb, "DMatrix") if tree_model == "XGBoost_hist" else (tree_embedding, "Pool")
+    constructor = getattr(backend, name)
+
+    def record_rows(data, label=None, **kwargs):
+        if label is not None:
+            batches.append(data["row_id"].to_numpy().tolist())
+        return constructor(data, label=label, **kwargs)
+
+    monkeypatch.setattr(backend, name, record_rows)
+    y = np.asarray(labels)
+    row_ids = np.arange(len(y))
+    X = pd.DataFrame({"row_id": row_ids}, index=row_ids // 2)
+    external_set = (X + len(y), y) if external else None
+    tree = TreeEmbedding(
+        tree_model=tree_model, cat_features=[], task_type="classification", seed=42, device="cpu",
+        n_estimators=4, max_depth=2, n_jobs=1, eval_size=eval_size, select_best_model=True,
+    )
+    tree.fit_tree(X, y, eval_set=external_set)
+
+    assert len(batches) == (2 if n_validation else 1)
+    train = batches[0]
+    val = batches[1] if n_validation else []
+    assert len(val) == n_validation
+    assert set(train).isdisjoint(val)
+    expected_rows = np.arange(2 * len(y)) if external else row_ids
+    assert sorted(train + val) == expected_rows.tolist()
+    assert set(y[train]) == set(y)
+    best = tree.model.get_best_iteration() if tree_model == "CatBoost" else getattr(tree.model, "best_iteration", None)
+    if n_validation:
+        assert best is not None and best >= 0
+    else:
+        assert best is None or best < 0
+        assert tree.transform(X, onehot_encode=False).shape == (len(X), tree.n_estimators)
