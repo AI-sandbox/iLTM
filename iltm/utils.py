@@ -72,6 +72,10 @@ def seed_everything(seed: int):
         torch.backends.cudnn.deterministic = True
 
 
+def fit_deadline_reached(fit_deadline: float | None) -> bool:
+    return fit_deadline is not None and time.time() >= fit_deadline
+
+
 class Linear:
     # Intentionally not inheriting from nn.Module as it decreases accuracy
     # (this possibly happened because the layer would be initialized after passing
@@ -817,7 +821,6 @@ def fine_tune_main_network(
         fit_time_cushion_frac: Fraction of average step time to use as a cushion when estimating if the next step can complete before the deadline.
     """
     t0 = time.time()
-    timeout_triggered = False
 
     step_times = deque(maxlen=50)
     avg_step_time = None
@@ -1192,15 +1195,18 @@ def fine_tune_main_network(
             )
         return improved
     # Initial validation before training
-    if val_loader is not None:
+    timeout_triggered = fit_deadline_reached(fit_deadline)
+    if val_loader is not None and not timeout_triggered:
         _ = validate_and_update(es, where="init")
 
     stop_training = False
     global_batch_idx = 0
 
     def _enough_time_for_val():
-        if fit_deadline is None or avg_step_time is None or val_loader is None:
+        if fit_deadline is None or val_loader is None:
             return True
+        if avg_step_time is None:
+            return not fit_deadline_reached(fit_deadline)
         # crude estimate: assume a val pass ~ len(val_loader) * avg_step_time
         est_val = max(1, len(val_loader)) * avg_step_time
         remaining = fit_deadline - time.time()
@@ -1208,6 +1214,9 @@ def fine_tune_main_network(
         return remaining > max(1e-3, needed)
 
     for epoch in range(max_epochs):
+        if fit_deadline_reached(fit_deadline):
+            timeout_triggered = True
+            break
         main_model.train()
         # Rebuild epoch loaders with new subset
         train_loader, val_loader, n_train_this_epoch = build_epoch_loaders(X_train, y_train)
@@ -1227,11 +1236,11 @@ def fine_tune_main_network(
         batches_run_this_epoch = 0
         for it, batch in enumerate(train_loader):
             inputs, targets, query_ids = batch if train_context_positions is None else (None, None, None)
-            # before starting a new step, check deadline using the running average
-            if fit_deadline is not None and avg_step_time:
+            # The first step has no timing estimate yet, but still has a deadline.
+            if fit_deadline is not None:
                 remaining = fit_deadline - time.time()
-                needed = avg_step_time * (1.0 + fit_time_cushion_frac)
-                if remaining <= max(1e-3, needed):
+                needed = max(1e-3, avg_step_time * (1.0 + fit_time_cushion_frac)) if avg_step_time else 0.0
+                if remaining <= needed:
                     timeout_triggered = True
                     logger.warning("Early return: finetuning budget nearly exhausted.")
                     break

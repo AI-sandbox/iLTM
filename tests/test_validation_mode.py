@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -49,7 +51,7 @@ class _FailingValidationModel(_ModeTrackingModel):
         return super().forward(X, *args, training=training, **kwargs)
 
 
-def _run_finetuning(monkeypatch, model_class):
+def _run_finetuning(monkeypatch, model_class, fit_deadline=None):
     monkeypatch.setattr(iltm_utils, "MainNetworkTrainable", model_class)
     X = torch.arange(9, dtype=torch.float32).reshape(-1, 1)
     return iltm_utils.fine_tune_main_network(
@@ -82,7 +84,7 @@ def _run_finetuning(monkeypatch, model_class):
         min_epochs=0,
         cooldown_checks=0,
         classification_val_metric="auto",
-        fit_deadline=None,
+        fit_deadline=fit_deadline,
     )
 
 
@@ -92,6 +94,21 @@ def test_validation_restores_training_and_exports_eval_mode(monkeypatch):
     assert result["training_modes"] == [True] * 10
     assert result["export_training"] is False
     assert result["norm"].training is False
+
+
+def test_finetuning_stops_before_first_step_if_initial_validation_uses_budget(monkeypatch):
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(iltm_utils, "time", SimpleNamespace(time=lambda: clock.now))
+
+    class ValidationUsesBudget(_ModeTrackingModel):
+        def forward(self, *args, training=False, **kwargs):
+            if not training:
+                clock.now = 101.0
+            return super().forward(*args, training=training, **kwargs)
+
+    result = _run_finetuning(monkeypatch, ValidationUsesBudget, fit_deadline=101.0)
+    assert result["timed_out"] is True
+    assert result["training_modes"] == []
 
 
 def test_validation_exception_restores_training_mode(monkeypatch):

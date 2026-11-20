@@ -1,8 +1,11 @@
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
 
 from iltm import iLTMClassifier, iLTMRegressor
+from iltm import inference_interface, utils
 
 
 class _TrainingModel(torch.nn.Module):
@@ -30,6 +33,7 @@ def _classifier(monkeypatch, *, n_ensemble=1):
 
 def test_fit_raises_timeout_if_budget_expires_before_first_predictor(monkeypatch):
     classifier = _classifier(monkeypatch)
+    monkeypatch.setattr(classifier, "_initialize_model", lambda: pytest.fail("loaded checkpoint with no fit budget"))
     X = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32)
     y = np.array([0, 1])
 
@@ -38,6 +42,60 @@ def test_fit_raises_timeout_if_budget_expires_before_first_predictor(monkeypatch
 
     assert classifier.predictors_ == []
     assert classifier._model is None
+
+
+@pytest.fixture
+def fit_clock(monkeypatch):
+    clock = SimpleNamespace(now=100.0)
+    clock.time = lambda: clock.now
+    monkeypatch.setattr(inference_interface, "time", clock)
+    monkeypatch.setattr(utils, "time", clock)
+    return clock
+
+
+@pytest.mark.parametrize("tree_for_each_predictor", [False, True])
+def test_deadline_checked_before_tree_fit(monkeypatch, fit_clock, tree_for_each_predictor):
+    model = _classifier(monkeypatch)
+    model.set_params(tree_embedding=True, tree_for_each_predictor=tree_for_each_predictor)
+
+    def split_at_deadline(X, y, **kwargs):
+        fit_clock.now = 101.0
+        return X, y, X, y
+
+    tree = SimpleNamespace(fit_tree=lambda *a, **k: pytest.fail("started tree fit after the deadline"))
+    monkeypatch.setattr(model, "_split_data_tree_embedding", split_at_deadline)
+    monkeypatch.setattr(model, "_create_tree_embedding", lambda **kwargs: tree)
+
+    X = np.eye(2, dtype=np.float32)
+    with pytest.raises(TimeoutError):
+        model.fit(X, np.array([0, 1]), fit_max_time=11.0)
+    assert not model.__sklearn_is_fitted__()
+
+
+def test_tree_overrun_keeps_completed_predictors_and_skips_alpha_scoring(monkeypatch, fit_clock):
+    model = _classifier(monkeypatch, n_ensemble=2)
+    model.set_params(tree_embedding=True, tree_for_each_predictor=True, tree_data_split="all")
+
+    def fit_slow_tree(*args, **kwargs):
+        fit_clock.now = 102.0
+
+    fast_tree = SimpleNamespace(fit_tree=lambda *a, **k: None, transform=lambda X: X[:, :1])
+    slow_tree = SimpleNamespace(
+        fit_tree=fit_slow_tree,
+        transform=lambda X: pytest.fail("transformed data after tree fit exhausted the budget"),
+    )
+    trees = iter([fast_tree, slow_tree])
+    predictor = {"timed_out": False}
+    monkeypatch.setattr(model, "_create_tree_embedding", lambda **kwargs: next(trees))
+    monkeypatch.setattr(model, "_generate_predictor", lambda *args, **kwargs: predictor)
+    monkeypatch.setattr(model, "_predict_ensemble", lambda *args, **kwargs: pytest.fail("started alpha scoring"))
+
+    X = np.eye(2, dtype=np.float32)
+    y = np.array([0, 1])
+    assert model.fit(X, y, eval_set=(X, y), fit_max_time=11.0) is model
+    assert model.predictors_ == [predictor]
+    assert model.tr_ == [fast_tree]
+    assert model.retrieval_alpha_ == model.retrieval_alpha
 
 
 def test_fit_rejects_empty_ensemble_without_timeout(monkeypatch):

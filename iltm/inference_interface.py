@@ -39,6 +39,7 @@ from iltm.utils import (
     full_main_forward,
     prepare_retrieval_context,
     fine_tune_main_network,
+    fit_deadline_reached,
     standardize_column_dtypes,
     check_stratification,
     compute_permutation_feature_importance,
@@ -1557,6 +1558,9 @@ class _iLTMBase(BaseEstimator):
             cur_init_tf_finetune = bool(self.initial_transformations_finetuning)
 
             while True:
+                if fit_deadline_reached(fit_deadline):
+                    fine_tuned_parts = {"timed_out": True}
+                    break
                 try:
                     fine_tuned_parts = fine_tune_main_network(
                         cfg=vars(self._model), X=X_, y=y, n_classes=n_outputs,
@@ -1926,6 +1930,9 @@ class _iLTMBase(BaseEstimator):
         fit_time_cushion_frac: float = 0.001,    # (0.1% headroom)
         return_partial_on_timeout: bool = True,
     ):
+        if fit_deadline_reached(fit_deadline):
+            raise TimeoutError("iLTM fit time budget expired before the first predictor could be generated.")
+
         # Reset state
         self.predictors_ = []
         self.preprocessors_ = []
@@ -2013,6 +2020,8 @@ class _iLTMBase(BaseEstimator):
             X_tree, y_tree, X_for_nn, y_for_nn = self._split_data_tree_embedding(
                 X_original, y_proc, random_state=self.seed
             )
+            if fit_deadline_reached(fit_deadline):
+                raise TimeoutError("iLTM fit time budget expired before fitting the shared tree.")
             if X_tree is X_for_nn and hasattr(self.tr_, "_fit_transform_training"):
                 X_emb_train = self.tr_._fit_transform_training(  # type: ignore[union-attr]
                     X_tree,
@@ -2027,7 +2036,11 @@ class _iLTMBase(BaseEstimator):
                     eval_set=tree_eval_set,
                     concat_with_orig_features=self.concat_tree_with_orig_features,
                 )  # type: ignore[union-attr]
+                if fit_deadline_reached(fit_deadline):
+                    raise TimeoutError("iLTM fit time budget expired during shared tree fitting.")
                 X_emb_train = self.tr_.transform(X_for_nn)  # type: ignore[union-attr]
+            if fit_deadline_reached(fit_deadline):
+                raise TimeoutError("iLTM fit time budget expired during shared tree fitting.")
             X_emb_val = None
             if X_val_original is not None:
                 X_emb_val = self.tr_.transform(X_val_original)  # type: ignore[union-attr]
@@ -2184,6 +2197,8 @@ class _iLTMBase(BaseEstimator):
                     X_tree, y_tree, X_for_nn, y_for_nn = self._split_data_tree_embedding(
                         X_original, y_proc, random_state=self.seed + i
                     )
+                    if fit_deadline_reached(fit_deadline):
+                        break
                     if X_tree is X_for_nn and hasattr(tree, "_fit_transform_training"):
                         X_emb_tr = tree._fit_transform_training(
                             X_tree,
@@ -2198,7 +2213,11 @@ class _iLTMBase(BaseEstimator):
                             eval_set=tree_eval_set,
                             concat_with_orig_features=predictor_concat,
                         )
+                        if fit_deadline_reached(fit_deadline):
+                            break
                         X_emb_tr = tree.transform(X_for_nn)
+                    if fit_deadline_reached(fit_deadline):
+                        break
                     X_emb_val = tree.transform(X_val_original) if X_val_original is not None else None
 
                     if predictor_concat:
@@ -2254,6 +2273,8 @@ class _iLTMBase(BaseEstimator):
                 f"X_val={_shape(X_val_tensor)}, y_val={_shape(y_val_tensor)}"
             )
             
+            if fit_deadline_reached(fit_deadline):
+                break
             pred = self._generate_predictor(
                 X_tensor, y_tensor,
                 n_outputs=n_outputs,
@@ -2318,6 +2339,13 @@ class _iLTMBase(BaseEstimator):
                     f"Stopped at {len(self.predictors_)} / {self.n_ensemble} predictors."
                 )
                 break
+
+        # A deadline can stop an iteration after its tree or preprocessor was created.
+        n_fitted = len(self.predictors_)
+        del self.preprocessors_[n_fitted:]
+        del self.predictor_configs_[n_fitted:]
+        if isinstance(self.tr_, list):
+            del self.tr_[n_fitted:]
 
         fit_end_time = time.time()
         fit_start_time_for_duration = getattr(self, '_fit_start_time', None)
@@ -2481,9 +2509,13 @@ class _iLTMBase(BaseEstimator):
         y: np.ndarray | pd.Series,
         *,
         n_outputs: int,
+        fit_deadline: float | None = None,
     ) -> None:
         self.retrieval_alpha_ = self.retrieval_alpha
         if not self.retrieval_alpha_adaptive or not self.do_retrieval:
+            return
+        if fit_deadline_reached(fit_deadline):
+            logger.info("Skipping adaptive retrieval alpha because the fit deadline has passed.")
             return
 
         y_array = np.asarray(y).reshape(-1)
@@ -2496,12 +2528,16 @@ class _iLTMBase(BaseEstimator):
             X = X.iloc[indices] if isinstance(X, pd.DataFrame) else X[indices]
             y_array = y_array[indices]
 
+        if fit_deadline_reached(fit_deadline):
+            return
         with torch.no_grad():
             main_outputs, retrieval_outputs = self._predict_ensemble(
                 X,
                 n_outputs=n_outputs,
                 return_retrieval_components=True,
             )
+        if fit_deadline_reached(fit_deadline):
+            return
         main_outputs = main_outputs.detach().float().cpu()
         retrieval_outputs = retrieval_outputs.detach().float().cpu()
 
@@ -2743,19 +2779,17 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
             Trees use it for early stopping by default. Set
             ``tree_use_external_eval_set=False`` to use a separate tree validation split.
         fit_max_time : float or None
-            Maximum time in seconds to allow for fitting. If None, no time
-            limit is applied. Zero raises ``TimeoutError`` immediately;
-            negative and non-finite values are invalid.
+            Best-effort time budget in seconds. Checks run between operations.
+            If the deadline stops fitting before a predictor is available, raises
+            ``TimeoutError``. ``None`` disables the deadline.
         fit_time_cushion_frac : float
             Fractional time cushion to add when checking for time budget during ensemble generation.
             Used to estimate if there's enough time for the next predictor.
         fit_time_margin_frac : float
-            Fractional time margin to reserve from fit_max_time for post-fit operations
-            (e.g., prediction, scoring). The effective training time becomes
-            fit_max_time * (1 - fit_time_margin_frac).
+            Fraction of fit_max_time to reserve for operations after fit.
         fit_time_margin_min_seconds : float
-            Minimum time to reserve from fit_max_time for post-fit operations
-            (e.g., prediction, scoring).
+            Minimum reserve for operations after fit. If the reserve consumes
+            the whole budget, fitting raises ``TimeoutError`` before loading a checkpoint.
         return_partial_on_timeout : bool
             If True, if the time limit triggers during creation of an ensemble member,
             include that member using the best weights at the moment of timeout.
@@ -2824,16 +2858,15 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
                         eval_set_proc[0],
                         eval_set_proc[1],
                         n_outputs=self.n_outputs_,
+                        fit_deadline=fit_deadline,
                     )
             if self.normalize_predictions_:
-                if eval_set_proc is None:
-                    calibration_X, calibration_y = X, y_proc
+                if fit_deadline_reached(fit_deadline):
+                    logger.info("Skipping prediction calibration because the fit deadline has passed.")
+                    self.normalize_predictions_ = False
                 else:
-                    calibration_X, calibration_y = eval_set_proc
-                self._fit_prediction_calibration(
-                    calibration_X,
-                    calibration_y,
-                )
+                    calibration_X, calibration_y = eval_set_proc if eval_set_proc is not None else (X, y_proc)
+                    self._fit_prediction_calibration(calibration_X, calibration_y)
         except BaseException:
             self._invalidate_fitted_state()
             self._release_training_model()
@@ -3091,19 +3124,17 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
             Trees use it for early stopping by default. Set
             ``tree_use_external_eval_set=False`` to use a separate tree validation split.
         fit_max_time : float or None
-            Maximum time in seconds to allow for fitting. If None, no time
-            limit is applied. Zero raises ``TimeoutError`` immediately;
-            negative and non-finite values are invalid.
+            Best-effort time budget in seconds. Checks run between operations.
+            If the deadline stops fitting before a predictor is available, raises
+            ``TimeoutError``. ``None`` disables the deadline.
         fit_time_cushion_frac : float
             Fractional time cushion to add when checking for time budget during ensemble generation.
             Used to estimate if there's enough time for the next predictor.
         fit_time_margin_frac : float
-            Fractional time margin to reserve from fit_max_time for post-fit operations
-            (e.g., prediction, scoring). The effective training time becomes
-            fit_max_time * (1 - fit_time_margin_frac).
+            Fraction of fit_max_time to reserve for operations after fit.
         fit_time_margin_min_seconds : float
-            Minimum time to reserve from fit_max_time for post-fit operations
-            (e.g., prediction, scoring).
+            Minimum reserve for operations after fit. If the reserve consumes
+            the whole budget, fitting raises ``TimeoutError`` before loading a checkpoint.
         return_partial_on_timeout : bool
             If True, if the time limit triggers during creation of an ensemble member,
             include that member using the best weights at the moment of timeout.
@@ -3190,6 +3221,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
                         eval_set[0],
                         eval_set[1],
                         n_outputs=self.n_outputs_,
+                        fit_deadline=fit_deadline,
                     )
         except BaseException:
             self._invalidate_fitted_state()
