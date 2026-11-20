@@ -1,6 +1,9 @@
+from types import SimpleNamespace
+
 import numpy as np
 import pandas as pd
 
+from iltm import iLTMClassifier
 from iltm.tree_embedding import TreeEmbedding
 from iltm.utils import detect_object_string_columns
 
@@ -13,6 +16,34 @@ def test_categorical_detection_handles_pandas_string_dtype():
     })
 
     assert detect_object_string_columns(X) == [0, 1]
+
+
+def test_refit_redetects_categories_from_constructor_settings(monkeypatch):
+    estimator = iLTMClassifier(
+        checkpoint=None, device="cpu", n_jobs=2, n_ensemble=1, cat_features=[0],
+        tree_model="XGBoost_hist", tree_embedding=True, tree_data_split="all",
+        tree_n_estimators=2, concat_tree_with_orig_features=True,
+        retrieval_alpha_adaptive=False, auto_stop_on_low_cpu_memory=False,
+    )
+    estimator.checkpoint = "unused"
+    monkeypatch.setattr(
+        estimator, "_initialize_model",
+        lambda: SimpleNamespace(pca_sampling="zeropad", n_dims=2, clip_data_value=1.0),
+    )
+    monkeypatch.setattr(estimator, "_generate_predictor", lambda *args, **kwargs: {"timed_out": False})
+    X = pd.DataFrame({"specified": [0, 1] * 4, "detected": ["a", "b"] * 4}, dtype=object)
+    y = np.arange(len(X)) % 2
+
+    estimator.fit(X, y)
+    assert estimator.cat_features_ == [0, 1]
+    assert estimator.tr_[0].cat_features == [0, 1]
+    assert estimator.preprocessors_[0]["pipeline"].cat_features == [0, 1]
+    assert estimator.get_params()["cat_features"] == [0]
+
+    estimator.fit(X[["specified"]], y)
+    assert estimator.cat_features_ == [0]
+    assert estimator.tr_[0].cat_features == [0]
+    assert estimator.preprocessors_[0]["pipeline"].cat_features == [0]
 
 
 def test_tree_validation_uses_training_categorical_encoder():

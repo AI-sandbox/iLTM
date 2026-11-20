@@ -828,6 +828,7 @@ class _iLTMBase(BaseEstimator):
         self.preprocessors_ = []
         self.predictor_configs_ = []
         self.tr_ = None
+        self.__dict__.pop("cat_features_", None)
         self.__dict__.pop("_prediction_calibration_slope_", None)
         self.__dict__.pop("_prediction_calibration_intercept_", None)
         self.__dict__.pop("retrieval_alpha_", None)
@@ -1126,7 +1127,7 @@ class _iLTMBase(BaseEstimator):
 
     def _concat_cat_features(self, tree: TreeEmbedding) -> list[int]:
         """Map categorical features to their positions in the retained original columns."""
-        cat_features = self.cat_features
+        cat_features = self.cat_features_
         if not cat_features:
             return []
         indices = getattr(tree, "orig_feature_indices_to_keep_", None)
@@ -1188,6 +1189,8 @@ class _iLTMBase(BaseEstimator):
 
         logger.debug(f"Preprocessing x {np.shape(x)} with type: {self.preprocessing}")
         preprocessing_objects: Dict[str, Any] = {}
+        if cat_features is None:
+            cat_features = getattr(self, "cat_features_", self.cat_features)
 
         if self.preprocessing == 'minimal':
             logger.debug("Preprocessing with minimal")
@@ -1201,7 +1204,7 @@ class _iLTMBase(BaseEstimator):
             y = np.array(y)
 
             if not self.tree_embedding:
-                preprocessing_objects['cat_features'] = self.cat_features if self.cat_features is not None else []
+                preprocessing_objects['cat_features'] = cat_features if cat_features is not None else []
             else:
                 preprocessing_objects['cat_features'] = []
 
@@ -1244,7 +1247,7 @@ class _iLTMBase(BaseEstimator):
         elif self.preprocessing == 'realmlp_td_s_v0':
             logger.debug("Preprocessing with realmlp_td_s_v0")
             preprocessing_objects['pipeline'] = get_realmlp_td_s_pipeline_separated(
-                cat_features=self.cat_features if cat_features is None else cat_features,
+                cat_features=cat_features,
                 # In the concat checkpoint, thousands of dense binary tree
                 # columns flow through the numerical branch. They ultimately
                 # become float32 in RobustScaleSmoothClipTransform, so prevent
@@ -1881,7 +1884,7 @@ class _iLTMBase(BaseEstimator):
                 feature_fraction = self.xgb_feature_fraction
         return TreeEmbedding(
             tree_model=tree_model,
-            cat_features=self.cat_features,
+            cat_features=getattr(self, "cat_features_", self.cat_features),
             seed=seed,
             task_type=self.task_type,
             n_estimators=self.tree_n_estimators,
@@ -1968,8 +1971,7 @@ class _iLTMBase(BaseEstimator):
         self.predictor_configs_ = []
         self._auto_tune_for_memory()
         
-        # Detect object columns with string content and add them to cat_features
-        self.cat_features = detect_object_string_columns(X_original, self.cat_features)
+        self.cat_features_ = detect_object_string_columns(X_original, self.cat_features)
         
         # helper to normalize 1D numpy targets
         def _as_numpy_1d(y, *, dtype=None) -> np.ndarray:
