@@ -6,7 +6,7 @@ import iltm.tree_embedding as tree_embedding
 from iltm.tree_embedding import TreeEmbedding
 
 
-def _tree(model, task):
+def _tree(model, task, n_jobs=-1):
     return TreeEmbedding(
         tree_model=model,
         cat_features=[],
@@ -16,6 +16,7 @@ def _tree(model, task):
         n_estimators=200,
         max_depth=6,
         max_leaves=31,
+        n_jobs=n_jobs,
     )
 
 
@@ -36,16 +37,21 @@ def test_xgboost_oom_backoff_reaches_cpu(monkeypatch):
             raise RuntimeError("CUDA out of memory")
         return fitted_model
 
-    monkeypatch.setattr(tree_embedding.xgb, "DMatrix", lambda *args, **kwargs: object())
+    def dmatrix(*args, nthread, **kwargs):
+        assert nthread == 2
+        return object()
+
+    monkeypatch.setattr(tree_embedding.xgb, "DMatrix", dmatrix)
     monkeypatch.setattr(tree_embedding.xgb, "train", train)
     monkeypatch.setattr(tree_embedding, "get_gpu_memory_info", lambda *args, **kwargs: None)
 
-    tree = _tree("XGBoost_hist", "regression")
+    tree = _tree("XGBoost_hist", "regression", n_jobs=2)
     tree._fit_model(*_data("regression"))
 
     assert tree.model is fitted_model
     assert calls[-1]["device"] == "cpu"
     assert calls[-1]["max_leaves"] == 31
+    assert all(params["nthread"] == 2 for params in calls)
 
 
 def test_xgboost_oom_backoff_reraises_after_cpu_failure(monkeypatch):
@@ -94,18 +100,28 @@ def test_catboost_oom_backoff_reaches_cpu(monkeypatch):
         def fit(self, *args, **kwargs):
             if self.params["task_type"] == "GPU":
                 raise RuntimeError("CUDA out of memory")
+            self.get_feature_importance()
             return self
 
+        def get_feature_importance(self, *, thread_count=-1):
+            assert thread_count == 2
+
+    def pool(*args, thread_count, **kwargs):
+        assert thread_count == 2
+        return object()
+
     monkeypatch.setattr(tree_embedding, "CatBoostClassifier", CatBoost)
-    monkeypatch.setattr(tree_embedding, "Pool", lambda *args, **kwargs: object())
+    monkeypatch.setattr(tree_embedding, "Pool", pool)
     monkeypatch.setattr(tree_embedding, "get_gpu_memory_info", lambda *args, **kwargs: None)
     monkeypatch.setattr(tree_embedding, "pick_gpu_ram_part", lambda *args, **kwargs: 0.8)
 
-    tree = _tree("CatBoost", "classification")
+    tree = _tree("CatBoost", "classification", n_jobs=2)
     tree._fit_model(*_data("classification"))
 
     assert tree.model.params["task_type"] == "CPU"
     assert calls[-1]["task_type"] == "CPU"
+    assert all(params["thread_count"] == 2 for params in calls)
+    assert "get_feature_importance" not in vars(tree.model)
 
 
 def test_catboost_oom_backoff_reraises_after_cpu_failure(monkeypatch):

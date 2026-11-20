@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import gc
 import warnings
+from contextlib import contextmanager
+from functools import partial
 import numpy as np
 import pandas as pd
 from sklearn.feature_selection import f_classif, f_regression
@@ -26,7 +28,23 @@ logger = logging.getLogger(__name__)
 _DENSE_ONEHOT_WORKING_SET_BYTES = 64 * 1024**2
 
 
+@contextmanager
+def _catboost_importance_threads(model, n_jobs):
+    if n_jobs == -1:
+        yield
+        return
+
+    # CatBoost fit calls get_feature_importance without forwarding thread_count.
+    model.get_feature_importance = partial(model.get_feature_importance, thread_count=n_jobs)
+    try:
+        yield
+    finally:
+        del model.get_feature_importance
+
+
 class TreeEmbedding:
+    n_jobs = -1  # Also the default for older serialized trees.
+
     def __init__(
         self,
         tree_model: str,
@@ -47,7 +65,8 @@ class TreeEmbedding:
         gamma: float = None,
         l2_leaf_reg: float = None,
         bagging_temperature: float = None,
-        onehot_max_features: bool = False
+        onehot_max_features: bool = False,
+        n_jobs: int = -1,
     ):
         """
         Initializes the TreeEmbedding class.
@@ -74,6 +93,7 @@ class TreeEmbedding:
             l2_leaf_reg (float): L2 regularization term on weights. Used by CatBoost (l2_leaf_reg) and XGBoost (reg_lambda).
             bagging_temperature (float): Controls intensity of Bayesian bagging. Used by CatBoost.
             onehot_max_features (bool): If True, one-hot encoded embeddings will be subset to the top 8192 most frequent features.
+            n_jobs (int): CPU thread count for parallel backends, or -1 for the default.
         """
         self.tree_model = tree_model
         self.cat_features = cat_features
@@ -93,6 +113,7 @@ class TreeEmbedding:
         self.l2_leaf_reg = l2_leaf_reg
         self.bagging_temperature = bagging_temperature
         self.onehot_max_features = onehot_max_features
+        self.n_jobs = n_jobs
         self.n_orig_features_to_keep_ = None
         self.orig_feature_indices_to_keep_ = None
 
@@ -281,6 +302,8 @@ class TreeEmbedding:
                 "random_state": self.seed,
                 "sparse_output": False,
             }
+            if self.n_jobs != -1:
+                params["n_jobs"] = self.n_jobs
             if self.n_estimators is not None:
                 params["n_estimators"] = self.n_estimators
             if self.max_depth is not None:
@@ -376,7 +399,7 @@ class TreeEmbedding:
                 'tree_method': 'hist' if self.tree_model == 'XGBoost_hist' else 'approx',
                 'seed': self.seed,
                 'device': self._xgboost_device(),
-                'n_jobs': -1
+                'nthread': self.n_jobs,
             }
             if self.task_type == 'regression':
                 params['objective'] = 'reg:squarederror'
@@ -411,11 +434,11 @@ class TreeEmbedding:
                 params['max_bin'] = max(64, int(params.get('max_bin', 256) // 2))
 
             X = self._handle_inf_and_value_too_large(X)
-            dtrain = xgb.DMatrix(X, y, enable_categorical=True)
+            dtrain = xgb.DMatrix(X, y, enable_categorical=True, nthread=self.n_jobs)
 
             if X_val is not None:
                 X_val = self._handle_inf_and_value_too_large(X_val)
-                dval = xgb.DMatrix(X_val, y_val, enable_categorical=True)
+                dval = xgb.DMatrix(X_val, y_val, enable_categorical=True, nthread=self.n_jobs)
                 evals = [(dtrain, 'train'), (dval, 'valid')]
             else:
                 dval = None
@@ -486,7 +509,7 @@ class TreeEmbedding:
                 'devices': self._catboost_devices(),
                 'random_seed': self.seed,
                 'verbose': 0,
-                'thread_count': -1,
+                'thread_count': self.n_jobs,
                 'allow_writing_files': False,
             }
             if self.n_estimators is not None:
@@ -556,12 +579,11 @@ class TreeEmbedding:
                 ctor = CatBoostClassifier
 
             X_prep = preprocess_cat_features_for_catboost(X, self.cat_features)
+            train_pool = Pool(X_prep, label=y, cat_features=self.cat_features, thread_count=self.n_jobs)
             if X_val is not None:
                 X_val_prep = preprocess_cat_features_for_catboost(X_val, self.cat_features)
-                train_pool = Pool(X_prep, label=y, cat_features=self.cat_features)
-                eval_pool = Pool(X_val_prep, label=y_val, cat_features=self.cat_features)
+                eval_pool = Pool(X_val_prep, label=y_val, cat_features=self.cat_features, thread_count=self.n_jobs)
             else:
-                train_pool = Pool(X_prep, label=y, cat_features=self.cat_features)
                 eval_pool = None
 
             max_attempts = 16
@@ -578,10 +600,11 @@ class TreeEmbedding:
                         catboost_params.get('devices', ''),
                     )
                     self.model = ctor(**catboost_params)
-                    if eval_pool is not None:
-                        self.model.fit(train_pool, eval_set=eval_pool, use_best_model=True, early_stopping_rounds=100)
-                    else:
-                        self.model.fit(train_pool)
+                    with _catboost_importance_threads(self.model, self.n_jobs):
+                        if eval_pool is not None:
+                            self.model.fit(train_pool, eval_set=eval_pool, use_best_model=True, early_stopping_rounds=100)
+                        else:
+                            self.model.fit(train_pool)
                     break  # success
 
                 except Exception as e:
@@ -655,7 +678,7 @@ class TreeEmbedding:
             if self._is_gpu_device() and padding_rows:
                 # Fill the final GPU block so XGBoost initializes every missing-value slot.
                 X = pd.concat([X, X.iloc[[0] * padding_rows]], ignore_index=True)
-            dtest = xgb.DMatrix(X, enable_categorical=True)
+            dtest = xgb.DMatrix(X, enable_categorical=True, nthread=self.n_jobs)
             predict_kwargs = {}
             if self.select_best_model:
                 best_iteration = getattr(self.model, 'best_iteration', None)
@@ -665,13 +688,13 @@ class TreeEmbedding:
 
         elif self.tree_model == 'CatBoost':
             X = preprocess_cat_features_for_catboost(X, self.cat_features)
-            test_pool = Pool(X, cat_features=self.cat_features)
+            test_pool = Pool(X, cat_features=self.cat_features, thread_count=self.n_jobs)
             leaf_kwargs = {}
             if self.select_best_model:
                 best_iteration = self.model.get_best_iteration()
                 if best_iteration is not None and best_iteration >= 0:
                     leaf_kwargs['ntree_end'] = int(best_iteration) + 1
-            emb = self.model.calc_leaf_indexes(test_pool, **leaf_kwargs)
+            emb = self.model.calc_leaf_indexes(test_pool, thread_count=self.n_jobs, **leaf_kwargs)
             del test_pool
             gc.collect()
 
@@ -917,11 +940,11 @@ class TreeEmbedding:
         if self.tree_model in ['GB']:
             raw_preds = self.model.predict(X_prepared)
         elif self.tree_model in ['XGBoost_approx', 'XGBoost_hist']:
-            dmat = xgb.DMatrix(X_prepared, enable_categorical=True)
+            dmat = xgb.DMatrix(X_prepared, enable_categorical=True, nthread=self.n_jobs)
             raw_preds = self.model.predict(dmat)
         elif self.tree_model == 'CatBoost':
             X_prepared = preprocess_cat_features_for_catboost(X_prepared, self.cat_features)
-            raw_preds = self.model.predict(X_prepared)
+            raw_preds = self.model.predict(X_prepared, thread_count=self.n_jobs)
             if len(raw_preds.shape) > 1:
                 assert raw_preds.shape[1] == 1, "CatBoost predictions should have shape [n_samples, 1]."
                 raw_preds = raw_preds.squeeze()

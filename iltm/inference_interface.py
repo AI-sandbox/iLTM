@@ -4,7 +4,9 @@ import os
 import gc
 import math
 import logging
+from contextlib import ExitStack
 from functools import wraps
+from numbers import Integral
 from threading import RLock
 from typing import List, Tuple, Optional, Dict, Any, Literal
 import time
@@ -54,7 +56,7 @@ logger = logging.getLogger(__name__)
 _AUTO_VAL_CHECKS_FULL = 4
 _AUTO_VAL_CHECKS_REDUCED = 2
 _AUTO_VAL_CHECKS_SMALL_TRAIN_MAX_ROWS = 25_000
-_CUDA_MATMUL_PRECISION_LOCK = RLock()
+_TORCH_SETTINGS_LOCK = RLock()
 
 
 def _cuda_matmul_override(matmul, effective_precision):
@@ -74,29 +76,28 @@ def _cuda_matmul_override(matmul, effective_precision):
             torch.backends.cudnn.fp32_precision = cuda_precision
 
 
-def _with_tf32(method):
+def _with_torch_settings(method):
     @wraps(method)
     def wrapped(self, *args, **kwargs):
-        allow_tf32 = self.allow_tf32
-        if self.device.type != "cuda":
+        # CUDA estimators also perform CPU work, such as retrieval scoring.
+        with _TORCH_SETTINGS_LOCK, ExitStack() as restore:
+            if self.n_jobs not in (None, -1):
+                previous_threads = torch.get_num_threads()
+                if previous_threads != self.n_jobs:
+                    restore.callback(torch.set_num_threads, previous_threads)
+                    torch.set_num_threads(int(self.n_jobs))
+
+            if self.device.type == "cuda" and self.allow_tf32 is not None:
+                matmul = torch.backends.cuda.matmul
+                try:
+                    effective_precision = matmul.fp32_precision
+                except AttributeError as exc:
+                    raise RuntimeError("Setting allow_tf32 for CUDA requires PyTorch 2.9 or newer.") from exc
+                previous = _cuda_matmul_override(matmul, effective_precision)
+                restore.callback(setattr, matmul, "fp32_precision", previous)
+                matmul.fp32_precision = "tf32" if self.allow_tf32 else "ieee"
+
             return method(self, *args, **kwargs)
-
-        # An inheriting call must also wait for iLTM's explicit overrides to end.
-        with _CUDA_MATMUL_PRECISION_LOCK:
-            if allow_tf32 is None:
-                return method(self, *args, **kwargs)
-
-            matmul = torch.backends.cuda.matmul
-            try:
-                effective_precision = matmul.fp32_precision
-            except AttributeError as exc:
-                raise RuntimeError("Setting allow_tf32 for CUDA requires PyTorch 2.9 or newer.") from exc
-            previous = _cuda_matmul_override(matmul, effective_precision)
-            try:
-                matmul.fp32_precision = "tf32" if allow_tf32 else "ieee"
-                return method(self, *args, **kwargs)
-            finally:
-                matmul.fp32_precision = previous
 
     return wrapped
 
@@ -219,12 +220,14 @@ class _iLTMBase(BaseEstimator):
 
     _model_cache: Dict[tuple, iLTM] = {}
     allow_tf32: bool | None = None  # Also the default for older serialized estimators.
+    n_jobs: int | None = None
 
     @preserve_random_state()
     def __init__(
         self,
         *,
         device: str = "cuda:0",
+        n_jobs: int | None = None,
         n_ensemble: int = 8,
         batch_size: int = 4096,
         seed: int = 3,
@@ -325,6 +328,11 @@ class _iLTMBase(BaseEstimator):
         finetuning_lr_adamw: float | None = None,
         finetuning_lr_lion: float | None = None,
     ) -> None:
+        if n_jobs is not None and (
+            isinstance(n_jobs, bool) or not isinstance(n_jobs, Integral) or n_jobs < -1 or n_jobs == 0
+        ):
+            raise ValueError("n_jobs must be None, -1, or a positive integer.")
+        self.n_jobs = n_jobs
 
         # Logging
         self.logging_level = logging_level
@@ -1857,6 +1865,7 @@ class _iLTMBase(BaseEstimator):
             l2_leaf_reg=self.tree_l2_leaf_reg,
             bagging_temperature=self.tree_bagging_temperature,
             onehot_max_features=self.onehot_max_features,
+            n_jobs=-1 if self.n_jobs is None else int(self.n_jobs),
         )
 
     def _subsample_external_validation(
@@ -2591,6 +2600,9 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
     ``allow_tf32=True`` allows TF32 for CUDA matmuls during fit and prediction.
     ``False`` uses IEEE FP32 matmuls, and ``None`` uses the caller's setting.
     An explicit setting on CUDA requires PyTorch 2.9+.
+
+    ``n_jobs`` sets the thread count for parallel tree backends and CPU PyTorch
+    work. ``None`` and ``-1`` keep the existing backend thread settings.
     """
 
     _prediction_calibration_max_rows = 4096
@@ -2696,13 +2708,14 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         xgb_feature_fraction: float | None = None,
         finetuning_lr_adamw: float | None = None,
         finetuning_lr_lion: float | None = None,
+        n_jobs: int | None = None,
     ) -> None:
         params = locals().copy()
         params.pop("self")
         params.pop("__class__")
         super().__init__(**params)
 
-    @_with_tf32
+    @_with_torch_settings
     @preserve_random_state()
     def fit(
         self,
@@ -2891,7 +2904,7 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         self._prediction_calibration_slope_ = slope
         self._prediction_calibration_intercept_ = intercept
 
-    @_with_tf32
+    @_with_torch_settings
     @preserve_random_state()
     def predict(self, X: np.ndarray | pd.DataFrame) -> np.ndarray:
         check_is_fitted(self)
@@ -2931,6 +2944,9 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
     ``allow_tf32=True`` allows TF32 for CUDA matmuls during fit and prediction.
     ``False`` uses IEEE FP32 matmuls, and ``None`` uses the caller's setting.
     An explicit setting on CUDA requires PyTorch 2.9+.
+
+    ``n_jobs`` sets the thread count for parallel tree backends and CPU PyTorch
+    work. ``None`` and ``-1`` keep the existing backend thread settings.
     """
 
     def __init__(
@@ -3036,6 +3052,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         xgb_feature_fraction: float | None = None,
         finetuning_lr_adamw: float | None = None,
         finetuning_lr_lion: float | None = None,
+        n_jobs: int | None = None,
     ) -> None:
         params = locals().copy()
         params.pop("self")
@@ -3044,7 +3061,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         super().__init__(**params)
         self.voting = voting
 
-    @_with_tf32
+    @_with_torch_settings
     @preserve_random_state()
     def fit(
         self,
@@ -3179,7 +3196,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         logger.debug(f"iLTMClassifier.fit END: Total fit duration={fit_total_duration:.2f}s")
         return result
 
-    @_with_tf32
+    @_with_torch_settings
     @preserve_random_state()
     def predict_proba(self, X: np.ndarray | pd.DataFrame) -> np.ndarray:
         check_is_fitted(self)
@@ -3188,7 +3205,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
         )
         return probs.cpu().numpy()
 
-    @_with_tf32
+    @_with_torch_settings
     @preserve_random_state()
     def predict(self, X: np.ndarray | pd.DataFrame) -> np.ndarray:
         if self.voting == 'soft':
