@@ -2,6 +2,8 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
+import torch
 
 from iltm import iLTMClassifier
 from iltm.tree_embedding import TreeEmbedding
@@ -16,6 +18,40 @@ def test_categorical_detection_handles_pandas_string_dtype():
     })
 
     assert detect_object_string_columns(X) == [0, 1]
+
+
+@pytest.mark.parametrize("checkpoint_name", ["cbrconcat", "rtr"])
+def test_pandas_category_dtype_reaches_checkpoint_preprocessing(monkeypatch, tmp_path, checkpoint_name):
+    checkpoint = tmp_path / f"{checkpoint_name}.pth"
+    checkpoint.touch()
+    estimator = iLTMClassifier(
+        checkpoint=str(checkpoint), device="cpu", n_jobs=2, n_ensemble=1,
+        cat_features=[2], tree_n_estimators=2, retrieval_alpha_adaptive=False,
+        auto_stop_on_low_cpu_memory=False,
+    )
+    monkeypatch.setattr(
+        estimator, "_initialize_model",
+        lambda: SimpleNamespace(pca_sampling="zeropad", n_dims=2, clip_data_value=1.0),
+    )
+    monkeypatch.setattr(estimator, "_generate_predictor", lambda *args, **kwargs: {"timed_out": False})
+    X = pd.DataFrame({
+        "text": pd.Categorical(["a", "b"] * 4),
+        "code": pd.Categorical([0.25, 0.5] * 4),
+        "specified": [0, 0, 1, 1] * 2,
+        "number": np.arange(8),
+    })
+    y = np.arange(len(X)) % 2
+
+    def forward(predictor, X, *, n_outputs, **kwargs):
+        assert torch.all(X[0, -3:-1] != X[1, -3:-1])
+        return torch.zeros((len(X), n_outputs))
+
+    monkeypatch.setattr(estimator, "_forward_pass_predictor", forward)
+    estimator.fit(X, y)
+
+    assert estimator.cat_features_ == [0, 1, 2]
+    assert estimator.preprocessors_[0]["pipeline"].cat_features == [0, 1, 2]
+    assert estimator.predict_proba(X).shape == (len(X), 2)
 
 
 def test_refit_redetects_categories_from_constructor_settings(monkeypatch):

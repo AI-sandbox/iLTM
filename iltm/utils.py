@@ -1935,11 +1935,11 @@ def select_top_correlated_features(correlations: np.ndarray, num_features: int) 
 
 def detect_object_string_columns(X: np.ndarray | pd.DataFrame, cat_features: list[int] | None = None) -> list[int]:
     """
-    Detect object and string columns that should be treated as categorical.
-    
-    This function identifies columns with object or pandas string dtype whose
-    observed values are strings and which weren't explicitly marked as categorical.
-    It avoids duplicates with already-identified categorical features.
+    Detect pandas categorical columns and string-valued columns.
+
+    Include columns with pandas category dtype and columns with object or
+    pandas string dtype whose observed values are strings. Merge them with
+    the explicitly supplied categorical feature indices.
     
     Parameters
     ----------
@@ -1952,18 +1952,18 @@ def detect_object_string_columns(X: np.ndarray | pd.DataFrame, cat_features: lis
     -------
     list[int]
         Combined list of categorical feature indices including both the original
-        cat_features and newly detected object/string columns (sorted, no duplicates)
+        cat_features and newly detected categorical columns (sorted, no duplicates)
     
     Examples
     --------
     >>> df = pd.DataFrame({
     ...     'num': [1, 2, 3],
     ...     'cat': pd.Categorical(['a', 'b', 'c']),
-    ...     'obj_str': ['x', 'y', 'z'],  # object dtype with strings
-    ...     'obj_num': [1.0, 2.0, 3.0]   # object dtype but numeric
+    ...     'obj_str': pd.Series(['x', 'y', 'z'], dtype=object),
+    ...     'obj_num': pd.Series([1.0, 2.0, 3.0], dtype=object),
     ... })
-    >>> detect_object_string_columns(df, cat_features=[1])
-    [1, 2]  # column 1 was already categorical, column 2 (obj_str) detected
+    >>> detect_object_string_columns(df)
+    [1, 2]
     """
     if cat_features is None:
         cat_features = []
@@ -1980,7 +1980,11 @@ def detect_object_string_columns(X: np.ndarray | pd.DataFrame, cat_features: lis
             continue
         
         col_data = df.iloc[:, col_idx]
-        
+
+        if isinstance(col_data.dtype, pd.CategoricalDtype):
+            detected_cat_features.add(col_idx)
+            continue
+
         if col_data.dtype == 'object' or isinstance(col_data.dtype, pd.StringDtype):
             non_null_values = col_data.dropna()
             if len(non_null_values) == 0:
