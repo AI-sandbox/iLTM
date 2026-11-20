@@ -125,6 +125,7 @@ def test_fit_releases_training_model_and_preserves_predictions(monkeypatch):
     predictions_after_release = classifier.predict_proba(X_test)
 
     assert classifier.__sklearn_is_fitted__()
+    assert classifier.n_ensemble_ == classifier.n_ensemble == 1
     assert classifier._model is None
     assert classifier._model_cache[cache_key] is training_model
     assert training_model.moves[-1] == "cpu"
@@ -204,6 +205,7 @@ def test_failed_fit_releases_cached_training_model(
     assert estimator.preprocessors_ == []
     assert estimator.tr_ is None
     assert not estimator.__sklearn_is_fitted__()
+    assert not hasattr(estimator, "n_ensemble_")
     with pytest.raises(NotFittedError):
         estimator.predict(X[:1])
 

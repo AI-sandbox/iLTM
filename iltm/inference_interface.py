@@ -816,6 +816,12 @@ class _iLTMBase(BaseEstimator):
             getattr(self, "preprocessors_", None)
         )
 
+    @property
+    def n_ensemble_(self) -> int:
+        """Number of ensemble members retained by the fitted estimator."""
+        check_is_fitted(self)
+        return len(self.predictors_)
+
     def _invalidate_fitted_state(self) -> None:
         self._fit_succeeded = False
         self.predictors_ = []
@@ -2391,7 +2397,7 @@ class _iLTMBase(BaseEstimator):
                     "iLTM fit time budget expired before the first predictor could be generated."
                 )
             raise RuntimeError("iLTM fit completed without generating any predictors.")
-        logger.info(f"{len(self.predictors_)} predictors generated. Model fitted and ready for inference.")
+        logger.info("Generated %d of %d requested ensemble members.", n_fitted, self.n_ensemble)
         return self
 
     # -----------------------------

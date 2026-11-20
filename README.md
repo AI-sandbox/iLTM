@@ -79,7 +79,7 @@ regardless of which directory contains the file.
 Common key args:
 - checkpoint: checkpoint name or path to model file. Default "xgbrconcat".
 - device: torch device string. Default "cuda:0".
-- n_ensemble: number of generated predictors.
+- `n_ensemble` sets the requested ensemble size. After fitting, `model.n_ensemble_` gives the number of members retained, including when a memory or time limit stops training early.
 - batch_size: batch size for weight prediction and inference.
 - preprocessing: "realmlp_td_s_v0" or "minimal" or "none".
 - cat_features: list of categorical column indices.

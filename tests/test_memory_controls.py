@@ -173,7 +173,8 @@ def test_cpu_memory_guard_stops_fit_loop():
 
     classifier.fit(X, y)
 
-    assert len(classifier.predictors_) == 1
+    assert classifier.n_ensemble == 3
+    assert classifier.n_ensemble_ == len(classifier.predictors_) == 1
     probabilities = classifier.predict_proba(X[:5])
     assert probabilities.shape == (5, 2)
     assert np.isfinite(probabilities).all()
