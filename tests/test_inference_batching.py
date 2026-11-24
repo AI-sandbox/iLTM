@@ -113,7 +113,9 @@ def test_reuses_context_per_predictor_and_prediction(monkeypatch, task, distance
         return original_forward(*args, **kwargs)
 
     monkeypatch.setattr(estimator, "_forward_pass_predictor", uncached_forward)
-    expected = predict()
+    with monkeypatch.context() as baseline:
+        baseline.setattr(interface, "_RETRIEVAL_CONTEXT_CACHE_BYTES", 0)
+        expected = predict()
     monkeypatch.setattr(estimator, "_forward_pass_predictor", original_forward)
     prepare = interface.prepare_retrieval_context
     prepared = []
@@ -135,13 +137,39 @@ def test_reuses_context_per_predictor_and_prediction(monkeypatch, task, distance
             torch.testing.assert_close(result, reference, rtol=0, atol=0)
     else:
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    predict()
+    assert len(prepared) == 2
+    assert "_retrieval_contexts" not in estimator.__getstate__()
     for predictor in estimator.predictors_:
         predictor["retrieval_parameters"]["retrieval_alpha"] = 0.5
         predictor["y_ctxt_superset"] = predictor["y_ctxt_superset"].flip(0)
         assert not any("cache" in key for key in predictor)
     predict()
     assert len(prepared) == 4
-    assert not any("cache" in key for key in estimator.__dict__)
+    estimator._invalidate_fitted_state()
+    assert "_retrieval_contexts" not in estimator.__dict__
+
+
+def test_persistent_cache_budget_is_shared_across_predictors(monkeypatch):
+    estimator, _ = _make_estimator("soft")
+    values = np.arange(28, dtype=np.float32).reshape(7, 4)
+    # Seven rows of four embedding values and two label values, all float32.
+    monkeypatch.setattr(interface, "_RETRIEVAL_CONTEXT_CACHE_BYTES", 7 * (4 + 2) * 4)
+    original = interface.prepare_retrieval_context
+    calls = []
+
+    def prepare(*args, **kwargs):
+        calls.append(len(args[0]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(interface, "prepare_retrieval_context", prepare)
+    expected = estimator.predict_proba(values)
+    actual = estimator.predict_proba(values)
+    assert calls == [7, 7, 7]
+    np.testing.assert_array_equal(actual, expected)
+    estimator.predictors_[0]["X_ctxt_superset"].add_(1)
+    estimator.predict_proba(values)
+    assert calls == [7] * 5
 
 
 @pytest.mark.parametrize("task", ["soft", "hard"])

@@ -57,6 +57,7 @@ _AUTO_VAL_CHECKS_FULL = 4
 _AUTO_VAL_CHECKS_REDUCED = 2
 _AUTO_VAL_CHECKS_SMALL_TRAIN_MAX_ROWS = 25_000
 _ALPHA_VALIDATION_CACHE_BYTES = 64 * 1024**2
+_RETRIEVAL_CONTEXT_CACHE_BYTES = 64 * 1024**2
 _TORCH_SETTINGS_LOCK = RLock()
 
 
@@ -806,6 +807,7 @@ class _iLTMBase(BaseEstimator):
 
     def _invalidate_fitted_state(self) -> None:
         self._fit_succeeded = False
+        self.__dict__.pop("_retrieval_contexts", None)
         self.predictors_ = []
         self.preprocessors_ = []
         self.predictor_configs_ = []
@@ -852,6 +854,7 @@ class _iLTMBase(BaseEstimator):
                 "n_dims": getattr(model, "n_dims", self.n_dims),
                 "clip_data_value": getattr(model, "clip_data_value", self.clip_data_value),
             }
+        state.pop("_retrieval_contexts", None)
         state["_model"] = None
         return state
 
@@ -1738,26 +1741,15 @@ class _iLTMBase(BaseEstimator):
         retrieval_distance = predictor['retrieval_parameters']['retrieval_distance']
 
         if isinstance(X, dict):
-            x_num = X['x_num']
-            x_cat = X['x_cat']
-            x_num_features = x_num.shape[1]
-            X_concat = torch.cat([x_num, x_cat], dim=1)
             if X_ctxt_superset is not None:
                 assert isinstance(X_ctxt_superset, dict)
-                x_ctxt_num = X_ctxt_superset['x_num']
-                x_ctxt_cat = X_ctxt_superset['x_cat']
-                assert x_ctxt_num.shape[1] == x_num_features
-                X_ctxt_superset_concat = torch.cat([x_ctxt_num, x_ctxt_cat], dim=1)
-            else:
-                X_ctxt_superset_concat = None
+                assert X_ctxt_superset["x_num"].shape[1] == X["x_num"].shape[1]
+            X_concat = torch.cat([X["x_num"], X["x_cat"]], dim=1)
         else:
             X_concat = X
-            X_ctxt_superset_concat = X_ctxt_superset
 
         if self.feature_bagging and feature_bagging_idxs is not None:
             X_concat = X_concat[:, feature_bagging_idxs]
-            if X_ctxt_superset_concat is not None:
-                X_ctxt_superset_concat = X_ctxt_superset_concat[:, feature_bagging_idxs]
 
         prepared_retrieval_context = (
             retrieval_context_cache.get("context")
@@ -1765,19 +1757,38 @@ class _iLTMBase(BaseEstimator):
             else None
         )
         if do_retrieval and prepared_retrieval_context is None:
-            prepared_retrieval_context = prepare_retrieval_context(
-                X_ctxt_superset_concat,
-                y_ctxt_superset,
-                n_outputs,
-                self._get_inference_model_config(),
-                rf,
-                pca,
-                norm,
-                main_network,
-                self.device,
-                False,
-                batch_size=self.batch_size,
+            context_tensors = (
+                (X_ctxt_superset["x_num"], X_ctxt_superset["x_cat"])
+                if isinstance(X_ctxt_superset, dict) else (X_ctxt_superset,)
             )
+            device = self.device
+            if device.type == "cuda" and device.index is None:
+                device = torch.device("cuda", torch.cuda.current_device())
+            source = (*context_tensors, y_ctxt_superset)
+            cacheable = all(not torch.is_inference(tensor) for tensor in source)
+            contexts = self.__dict__.setdefault("_retrieval_contexts", {})
+            precision = getattr(torch.backends.cuda.matmul, "fp32_precision", None) if device.type == "cuda" else None
+            key = (
+                tuple((tensor.data_ptr(), tensor._version) for tensor in source) if cacheable else None,
+                self.batch_size, self.feature_bagging, n_outputs, device, torch.get_num_threads(),
+                precision or torch.get_float32_matmul_precision(), torch.is_autocast_enabled(device.type),
+                torch.get_autocast_dtype(device.type),
+            )
+            saved = contexts.get(id(predictor))
+            if cacheable and saved is not None and saved[0] == key:
+                prepared_retrieval_context = tuple(t.to(self.device) for t in saved[1])
+            else:
+                contexts.pop(id(predictor), None)
+                context_input = torch.cat(context_tensors, dim=1) if isinstance(X_ctxt_superset, dict) else X_ctxt_superset
+                if self.feature_bagging and feature_bagging_idxs is not None:
+                    context_input = context_input[:, feature_bagging_idxs]
+                prepared_retrieval_context = prepare_retrieval_context(
+                    context_input, y_ctxt_superset, n_outputs, self._get_inference_model_config(),
+                    rf, pca, norm, main_network, self.device, False, batch_size=self.batch_size,
+                )
+                size = sum(t.nbytes for t in prepared_retrieval_context)
+                if cacheable and size + sum(entry[2] for entry in contexts.values()) <= _RETRIEVAL_CONTEXT_CACHE_BYTES:
+                    contexts[id(predictor)] = (key, tuple(t.detach().cpu() for t in prepared_retrieval_context), size)
             if retrieval_context_cache is not None:
                 retrieval_context_cache["context"] = prepared_retrieval_context
 
@@ -1796,7 +1807,7 @@ class _iLTMBase(BaseEstimator):
                         bs,
                         model_cfg,
                         rf, pca, norm, main_network, self.device, self.use_amp_inference,
-                        do_retrieval, X_ctxt_superset_concat, y_ctxt_superset,
+                        do_retrieval, X_ctxt_superset, y_ctxt_superset,
                         retrieval_alpha, retrieval_temperature, retrieval_distance,
                         prepared_retrieval_context=prepared_retrieval_context,
                         return_retrieval_components=return_retrieval_components,
