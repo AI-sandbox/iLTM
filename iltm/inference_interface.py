@@ -56,6 +56,7 @@ logger = logging.getLogger(__name__)
 _AUTO_VAL_CHECKS_FULL = 4
 _AUTO_VAL_CHECKS_REDUCED = 2
 _AUTO_VAL_CHECKS_SMALL_TRAIN_MAX_ROWS = 25_000
+_ALPHA_VALIDATION_CACHE_BYTES = 64 * 1024**2
 _TORCH_SETTINGS_LOCK = RLock()
 
 
@@ -1962,6 +1963,7 @@ class _iLTMBase(BaseEstimator):
         fit_deadline: float | None = None,
         fit_time_cushion_frac: float = 0.001,    # (0.1% headroom)
         return_partial_on_timeout: bool = True,
+        alpha_validation_inputs: list[Tensor | dict[str, Tensor]] | None = None,
     ):
         if fit_deadline_reached(fit_deadline):
             raise TimeoutError("iLTM fit time budget expired before the first predictor could be generated.")
@@ -2043,6 +2045,17 @@ class _iLTMBase(BaseEstimator):
         else:
             X_val_original, y_val_proc = None, None
             y_val_tensor_base = None
+
+        # Reuse is safe when alpha scoring will preprocess the very same rows in one chunk.
+        if alpha_validation_inputs is not None and (
+            eval_set is None
+            or X_val_original is not eval_set[0]
+            or (self.val_max_samples is not None and len(y_val_proc) > self.val_max_samples)
+            or len(y_val_proc) > self._inference_rows_per_chunk()
+            or not (self._checkpoint_mix_configs or (self.tree_embedding and self.tree_for_each_predictor))
+        ):
+            alpha_validation_inputs = None
+        alpha_validation_bytes = 0
 
         tree_eval_set = eval_set if self.tree_use_external_eval_set else None
 
@@ -2364,6 +2377,14 @@ class _iLTMBase(BaseEstimator):
                 if pred["timed_out"] and len(self.predictors_) == 0 and not return_partial_on_timeout:
                     logger.warning("return_partial_on_timeout is False but the first predictor timed out. Returning this predictor anyway.")
                 self.predictors_.append(pred)
+                if alpha_validation_inputs is not None and X_val_tensor is not None:
+                    tensors = X_val_tensor.values() if isinstance(X_val_tensor, dict) else (X_val_tensor,)
+                    alpha_validation_bytes += sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+                    if alpha_validation_bytes <= _ALPHA_VALIDATION_CACHE_BYTES:
+                        alpha_validation_inputs.append(X_val_tensor)
+                    else:
+                        alpha_validation_inputs.clear()
+                        alpha_validation_inputs = None
                 logger.debug(f"_fit_common: Added predictor {i+1} to ensemble (total={len(self.predictors_)})")
                 # If this predictor timed out, don't start another one. Stop here and use the partial ensemble.
                 if pred["timed_out"]:
@@ -2424,6 +2445,12 @@ class _iLTMBase(BaseEstimator):
 
         return self._preprocess_test_data(X_work, self.preprocessors_[0])
 
+    def _inference_rows_per_chunk(self) -> int:
+        try:
+            return int(self.inference_chunk_rows)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return 10_000
+
     def _predict_ensemble(
         self,
         X_original: np.ndarray | pd.DataFrame,
@@ -2432,6 +2459,7 @@ class _iLTMBase(BaseEstimator):
         softmax_per_predictor: bool = False,
         return_retrieval_components: bool = False,
         hard_voting: bool = False,
+        alpha_validation_inputs: list[Tensor | dict[str, Tensor]] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         check_is_fitted(self)
 
@@ -2469,10 +2497,7 @@ class _iLTMBase(BaseEstimator):
 
                 # Chunked per predictor path
                 n_samples = X_original.shape[0] if isinstance(X_original, np.ndarray) else len(X_original)
-                try:
-                    chunk_rows = int(self.inference_chunk_rows)
-                except Exception:
-                    chunk_rows = 10000
+                chunk_rows = self._inference_rows_per_chunk()
 
                 outs_chunks: List[Tensor] = []
                 retrieval_outs_chunks: List[Tensor] = []
@@ -2484,23 +2509,26 @@ class _iLTMBase(BaseEstimator):
                     )
                     for start in range(0, n_samples, chunk_rows):
                         end = min(start + chunk_rows, n_samples)
-                        X_batch_orig = X_original.iloc[start:end] if isinstance(X_original, pd.DataFrame) else X_original[start:end]
-                        if predictor_tree_embedding:
-                            X_emb = tree.transform(X_batch_orig)
-                            if predictor_concat:
-                                X_batch_base = self._select_original_features_for_tree(
-                                    tree,
-                                    X_batch_orig,
-                                )
-                                X_batch = self._concatenate_original_and_tree_features(
-                                    X_batch_base, X_emb
-                                )
-                            else:
-                                X_batch = X_emb
+                        if alpha_validation_inputs is not None:
+                            X_tensor = alpha_validation_inputs[i]
                         else:
-                            X_batch = X_batch_orig
+                            X_batch_orig = X_original.iloc[start:end] if isinstance(X_original, pd.DataFrame) else X_original[start:end]
+                            if predictor_tree_embedding:
+                                X_emb = tree.transform(X_batch_orig)
+                                if predictor_concat:
+                                    X_batch_base = self._select_original_features_for_tree(
+                                        tree,
+                                        X_batch_orig,
+                                    )
+                                    X_batch = self._concatenate_original_and_tree_features(
+                                        X_batch_base, X_emb
+                                    )
+                                else:
+                                    X_batch = X_emb
+                            else:
+                                X_batch = X_batch_orig
 
-                        X_tensor = self._preprocess_test_data(X_batch, self.preprocessors_[i])
+                            X_tensor = self._preprocess_test_data(X_batch, self.preprocessors_[i])
                         out = self._forward_pass_predictor(
                             predictor,
                             X_tensor,
@@ -2558,6 +2586,7 @@ class _iLTMBase(BaseEstimator):
         *,
         n_outputs: int,
         fit_deadline: float | None = None,
+        alpha_validation_inputs: list[Tensor | dict[str, Tensor]] | None = None,
     ) -> None:
         self.retrieval_alpha_ = self.retrieval_alpha
         if not self.retrieval_alpha_adaptive or not self.do_retrieval:
@@ -2575,6 +2604,7 @@ class _iLTMBase(BaseEstimator):
             )
             X = X.iloc[indices] if isinstance(X, pd.DataFrame) else X[indices]
             y_array = y_array[indices]
+            alpha_validation_inputs = None
 
         if fit_deadline_reached(fit_deadline):
             return
@@ -2583,6 +2613,7 @@ class _iLTMBase(BaseEstimator):
                 X,
                 n_outputs=n_outputs,
                 return_retrieval_components=True,
+                alpha_validation_inputs=alpha_validation_inputs or None,
             )
         if fit_deadline_reached(fit_deadline):
             return
@@ -2884,6 +2915,7 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         # Regression has one output
         self.n_outputs_ = 1
         
+        alpha_validation_inputs = [] if self.retrieval_alpha_adaptive and self.do_retrieval else None
         try:
             with fit_random_generators(self.seed):
                 result = self._fit_common(
@@ -2893,6 +2925,7 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
                     fit_deadline=fit_deadline,
                     fit_time_cushion_frac=fit_time_cushion_frac,
                     return_partial_on_timeout=return_partial_on_timeout,
+                    alpha_validation_inputs=alpha_validation_inputs,
                 )
             self._fit_succeeded = True
             if self.retrieval_alpha_adaptive:
@@ -2907,7 +2940,9 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
                         eval_set_proc[1],
                         n_outputs=self.n_outputs_,
                         fit_deadline=fit_deadline,
+                        alpha_validation_inputs=alpha_validation_inputs,
                     )
+            del alpha_validation_inputs
             if self.normalize_predictions_:
                 if fit_deadline_reached(fit_deadline):
                     logger.info("Skipping prediction calibration because the fit deadline has passed.")
@@ -3261,6 +3296,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
                 )
                 eval_set = eval_X, eval_y_proc
 
+        alpha_validation_inputs = [] if self.retrieval_alpha_adaptive and self.do_retrieval else None
         try:
             with fit_random_generators(self.seed):
                 result = self._fit_common(
@@ -3270,6 +3306,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
                     fit_deadline=fit_deadline,
                     fit_time_cushion_frac=fit_time_cushion_frac,
                     return_partial_on_timeout=return_partial_on_timeout,
+                    alpha_validation_inputs=alpha_validation_inputs,
                 )
             self._fit_succeeded = True
             if self.retrieval_alpha_adaptive:
@@ -3284,6 +3321,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
                         eval_set[1],
                         n_outputs=self.n_outputs_,
                         fit_deadline=fit_deadline,
+                        alpha_validation_inputs=alpha_validation_inputs,
                     )
         except BaseException:
             self._invalidate_fitted_state()

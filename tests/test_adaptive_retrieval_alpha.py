@@ -1,8 +1,12 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
 
-from iltm import iLTMClassifier, iLTMRegressor
+from iltm import iLTMClassifier, iLTMRegressor, inference_interface
 
 
 def _predictors(count):
@@ -134,3 +138,87 @@ def test_retrieval_components_are_collected_once_per_predictor(monkeypatch):
     assert main.shape == (2, 3, 2)
     assert retrieval.shape == (2, 3, 2)
     assert torch.allclose(retrieval - main, torch.full_like(main, 10.0))
+
+
+@pytest.mark.parametrize("model_cls", [iLTMRegressor, iLTMClassifier])
+@pytest.mark.parametrize(
+    "mode", ["reuse", "subsampled", "chunked", "over_budget", "partial"]
+)
+def test_fit_reuses_validation_inputs_only_when_equivalent(
+    monkeypatch, model_cls, mode
+):
+    model = model_cls(
+        checkpoint=None,
+        device="cpu",
+        n_jobs=1,
+        n_ensemble=2,
+        tree_embedding=True,
+        tree_for_each_predictor=True,
+        tree_model="XGBoost_hist",
+        tree_n_estimators=3,
+        preprocessing="none",
+        val_max_samples=4 if mode == "subsampled" else None,
+    )
+    model.checkpoint = "unused"
+    monkeypatch.setattr(
+        model,
+        "_initialize_model",
+        lambda: SimpleNamespace(pca_sampling="zeropad", n_dims=1, clip_data_value=1.0),
+    )
+    if mode == "chunked":
+        model.inference_chunk_rows = 2
+    if mode == "over_budget":
+        monkeypatch.setattr(inference_interface, "_ALPHA_VALIDATION_CACHE_BYTES", 1)
+
+    def generate(*args, **kwargs):
+        predictor = _predictors(1)[0]
+        predictor["index"] = len(model.predictors_)
+        predictor["timed_out"] = mode == "partial" and predictor["index"] == 1
+        return predictor
+
+    def forward(predictor, X, n_outputs, **kwargs):
+        values = X[:, :n_outputs] + predictor["index"]
+        return values, -values
+
+    monkeypatch.setattr(model, "_generate_predictor", generate)
+    monkeypatch.setattr(model, "_forward_pass_predictor", forward)
+    preprocess = model._preprocess_test_data
+    preprocess_calls = []
+    ensemble = model._predict_ensemble
+    alpha_passes = []
+
+    def record_preprocessing(X, preprocessor):
+        preprocess_calls.append(None)
+        return preprocess(X, preprocessor)
+
+    def record_alpha_pass(X, **kwargs):
+        before = len(preprocess_calls)
+        components = ensemble(X, **kwargs)
+        alpha_passes.append((len(preprocess_calls) - before, components))
+        return components
+
+    monkeypatch.setattr(model, "_preprocess_test_data", record_preprocessing)
+    monkeypatch.setattr(model, "_predict_ensemble", record_alpha_pass)
+    rng = np.random.default_rng(42)
+    data = rng.normal(size=(26, 3)).astype(np.float32)
+    y = np.tile([0, 1], 13)
+    model.fit(
+        data[:18], y[:18], eval_set=(data[18:], y[18:]), return_partial_on_timeout=False
+    )
+    assert len(model.predictors_) == (1 if mode == "partial" else 2)
+    alpha = model.retrieval_alpha_
+
+    y_val = y[18:]
+    if model_cls is iLTMRegressor:
+        y_val = ((y_val.astype(np.float32) - model._y_mean) / model._y_std).astype(
+            np.float32
+        )
+    model._fit_adaptive_retrieval_alpha(data[18:], y_val, n_outputs=model.n_outputs_)
+    assert model.retrieval_alpha_ == alpha
+    (fit_calls, fit_components), (raw_calls, raw_components) = alpha_passes
+    assert raw_calls > 0
+    assert fit_calls == (0 if mode in ("reuse", "partial") else raw_calls)
+    for fit_component, raw_component in zip(
+        fit_components, raw_components, strict=True
+    ):
+        torch.testing.assert_close(fit_component, raw_component, rtol=0, atol=0)
