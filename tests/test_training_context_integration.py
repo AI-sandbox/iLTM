@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
 from iltm import utils
+from iltm._random import fit_random_generators, torch_generator
 
 
 class _RecordingModel(torch.nn.Module):
@@ -175,3 +178,109 @@ def test_borrowed_context_keeps_cpu_sampler_order_and_rng(monkeypatch):
     assert expected[2][0] == actual[2][0]
     assert np.array_equal(expected[2][1], actual[2][1])
     assert expected[2][2:] == actual[2][2:]
+
+
+@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
+@pytest.mark.parametrize(
+    "n_rows,batch_size,subset_frac,bootstrap,reuses_projection",
+    [
+        (1, 8, None, False, True),
+        (9, 12, None, False, True),
+        (9, 9, None, True, True),
+        (9, 8, None, False, False),
+        (9, 12, 0.5, False, False),
+    ],
+)
+def test_single_batch_projection_reuse(
+    device_name,
+    n_rows,
+    batch_size,
+    subset_frac,
+    bootstrap,
+    reuses_projection,
+    monkeypatch,
+):
+    if device_name == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    device = torch.device(device_name)
+    model_class = utils.MainNetworkTrainable
+
+    def run(*, reuse):
+        _seed()
+        X = torch.randn(n_rows + 3, 5)
+        y = torch.arange(len(X)) % 3
+        rf = torch.nn.Sequential(torch.nn.Linear(5, 8, bias=False), torch.nn.ReLU())
+        pca = SimpleNamespace(mean_=torch.randn(8), components_=torch.randn(4, 8))
+        norm = utils.SimpleBatchNorm1dFixed(6)
+        norm.fit(torch.randn(12, 6))
+        layers = [
+            utils.Linear(0.1 * torch.randn(6, n_outputs), torch.zeros(n_outputs))
+            for n_outputs in (6, 3)
+        ]
+        outputs = []
+        projection_calls = []
+        projection_grads = []
+        norm_states = []
+
+        class RecordingModel(model_class):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.rf.register_forward_hook(
+                    lambda *_: projection_calls.append(self.training)
+                )
+                self.rf[0].weight.register_hook(
+                    lambda grad: projection_grads.append(grad.detach().cpu().clone())
+                )
+
+            def forward(self, *args, **kwargs):
+                if not reuse:
+                    kwargs.pop("query_context_positions", None)
+                result = super().forward(*args, **kwargs)
+                outputs.append(result.detach().cpu())
+                norm_states.append(
+                    {
+                        name: value.detach().cpu().clone()
+                        for name, value in self.norm.named_buffers()
+                    }
+                )
+                return result
+
+        monkeypatch.setattr(utils, "MainNetworkTrainable", RecordingModel)
+        with fit_random_generators(421):
+            result = utils.fine_tune_main_network(
+                cfg={"n_dims": 6, "pca_sampling": "zeropad", "clip_data_value": 2.5},
+                X=X[:n_rows],
+                y=y[:n_rows],
+                X_val=X[n_rows:],
+                y_val=y[n_rows:],
+                n_classes=3,
+                rf=rf,
+                pca=pca,
+                main_network=layers,
+                norm=norm,
+                device=device,
+                max_epochs=2,
+                batch_size=batch_size,
+                finetuning_optimizer="lion",
+                finetuning_dropout=0.15,
+                do_retrieval=True,
+                finetuning_data="bootstrap" if bootstrap else "entire_dataset",
+                finetuning_subset_frac=subset_frac,
+            )
+            rng_states = [
+                torch_generator().get_state(),
+                torch_generator(device).get_state(),
+            ]
+        assert not result["timed_out"]
+        return outputs, projection_calls, projection_grads, norm_states, rng_states
+
+    expected = run(reuse=False)
+    actual = run(reuse=True)
+    outputs, calls, gradients, norm_states, rng_states = actual
+    rtol, atol = 2e-5, 2e-6
+    torch.testing.assert_close(outputs, expected[0], rtol=rtol, atol=atol)
+    torch.testing.assert_close(gradients, expected[2], rtol=rtol, atol=atol)
+    torch.testing.assert_close(norm_states, expected[3], rtol=rtol, atol=atol)
+    torch.testing.assert_close(rng_states, expected[4], rtol=0, atol=0)
+    assert sum(calls) == len(gradients) * (1 if reuses_projection else 2)
+    assert calls.count(False) == expected[1].count(False)

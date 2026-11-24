@@ -244,16 +244,17 @@ def sample_data(X: Tensor | dict, y: Tensor,
 
 
 def transform_data_for_main_network(X, cfg, device, rf, pca, norm,
-                                    training_finetuning: bool = False):
+                                    training_finetuning: bool = False, *, input_projected: bool = False):
     with torch.set_grad_enabled(training_finetuning):
-        if X.dtype != torch.float32:
-            X = X.to(torch.float32)
-        X = X.to(device)
-        X = rf(X)
-        X = pca.transform(X)
-        if cfg['pca_sampling'] == 'zeropad' and X.shape[1] < cfg['n_dims']:
-            X = F.pad(X, (0, cfg['n_dims'] - X.shape[1]), value=0)
-        X = torch.clamp(X, -cfg['clip_data_value'], cfg['clip_data_value'])
+        if not input_projected:
+            if X.dtype != torch.float32:
+                X = X.to(torch.float32)
+            X = X.to(device)
+            X = rf(X)
+            X = pca.transform(X)
+            if cfg['pca_sampling'] == 'zeropad' and X.shape[1] < cfg['n_dims']:
+                X = F.pad(X, (0, cfg['n_dims'] - X.shape[1]), value=0)
+            X = torch.clamp(X, -cfg['clip_data_value'], cfg['clip_data_value'])
         if norm is not None:
             singleton_batch_norm = (
                 training_finetuning
@@ -314,11 +315,12 @@ def forward_main_network(
 
 
 def forward_main_network_with_preprocessing(X, model_cfg, rf, pca, norm, main_network, device, use_amp=False,
-                                            training_finetuning: bool = False, finetuning_dropout: float = 0.0
-                                            ) -> Tuple[Tensor, Tensor]:
+                                            training_finetuning: bool = False, finetuning_dropout: float = 0.0,
+                                            *, input_projected: bool = False) -> Tuple[Tensor, Tensor]:
 
     X_transformed = transform_data_for_main_network(X=X, cfg=model_cfg, rf=rf, pca=pca, norm=norm, device=device,
-                                                    training_finetuning=training_finetuning)
+                                                    training_finetuning=training_finetuning,
+                                                    input_projected=input_projected)
 
     with torch.amp.autocast(device_type=device.type, enabled=use_amp):
         outputs, intermediate_state = forward_main_network(
@@ -382,7 +384,7 @@ def retrieval(X_ctxt_superset, y_ctxt_superset, intermediate_state, n_classes, b
               prepared_context: tuple[Tensor, Tensor] | None = None,
               query_ids: Tensor | None = None,
               context_ids_superset: Tensor | None = None,
-              return_valid_mask: bool = False) -> Tensor | tuple[Tensor, Tensor]:
+              return_valid_mask: bool = False, *, context_projected: bool = False) -> Tensor | tuple[Tensor, Tensor]:
     # Based on ModernNCA code: https://github.com/qile2000/LAMDA-TALENT/blob/main/LAMDA_TALENT/model/methods/modernNCA.py
     if (query_ids is None) != (context_ids_superset is None):
         raise ValueError("query_ids and context_ids_superset must be provided together.")
@@ -416,8 +418,11 @@ def retrieval(X_ctxt_superset, y_ctxt_superset, intermediate_state, n_classes, b
             y_ctxt = F.one_hot(y_ctxt, num_classes=n_classes).float()
         else:  # n_classes == 1 for regression, but y_ctxt is a 1D tensor
             y_ctxt = y_ctxt.unsqueeze(-1)
-        _, X_ctxt = forward_main_network_with_preprocessing(X_ctxt, model_cfg, rf, pca, norm, main_network, device, use_amp,
-                                                            training_finetuning=training_finetuning, finetuning_dropout=finetuning_dropout)
+        _, X_ctxt = forward_main_network_with_preprocessing(
+            X_ctxt, model_cfg, rf, pca, norm, main_network, device, use_amp,
+            training_finetuning=training_finetuning, finetuning_dropout=finetuning_dropout,
+            input_projected=context_projected,
+        )
     else:
         X_ctxt, y_ctxt = prepared_context
         context_ids = None
@@ -457,17 +462,28 @@ def full_main_forward(X_grad, n_classes, batch_size, model_cfg,
                       prepared_retrieval_context: tuple[Tensor, Tensor] | None = None,
                       return_retrieval_components: bool = False,
                       query_ids: Tensor | None = None,
-                      context_ids_superset: Tensor | None = None) -> Tensor | tuple[Tensor, Tensor]:
+                      context_ids_superset: Tensor | None = None,
+                      *, query_context_positions: Tensor | None = None) -> Tensor | tuple[Tensor, Tensor]:
 
     if do_retrieval:
         use_amp = False
 
+    reuse_projection = do_retrieval and training_finetuning and query_context_positions is not None
+    if reuse_projection:
+        X_grad = transform_data_for_main_network(
+            X_grad, model_cfg, device, rf, pca, norm=None, training_finetuning=True,
+        )
+
     outputs, intermediate_state = forward_main_network_with_preprocessing(
         X_grad, model_cfg, rf, pca, norm, main_network, device, use_amp=use_amp,
         training_finetuning=training_finetuning, finetuning_dropout=finetuning_dropout,
+        input_projected=reuse_projection,
     )
 
     if do_retrieval:
+        if reuse_projection:
+            # Restore context order before retrieval samples rows. BatchNorm and dropout run for each branch.
+            X_ctxt_superset = X_grad.index_select(0, query_context_positions.argsort())
         retrieval_result = retrieval(
             X_ctxt_superset, y_ctxt_superset, intermediate_state, n_classes,
             batch_size, retrieval_distance, retrieval_temperature,
@@ -477,6 +493,7 @@ def full_main_forward(X_grad, n_classes, batch_size, model_cfg,
             query_ids=query_ids,
             context_ids_superset=context_ids_superset,
             return_valid_mask=query_ids is not None,
+            context_projected=reuse_projection,
         )
         if query_ids is None:
             retrieval_outputs = retrieval_result
@@ -641,13 +658,14 @@ class MainNetworkTrainable(nn.Module):
 
     def forward(self, X: Tensor, X_ctxt_superset: Tensor | None = None, y_ctxt_superset: Tensor | None = None,
                 training: bool = False, query_ids: Tensor | None = None,
-                context_ids_superset: Tensor | None = None):
+                context_ids_superset: Tensor | None = None, *, query_context_positions: Tensor | None = None):
         return full_main_forward(X, self.n_classes, self.batch_size, self.cfg,
                                  self.rf, self.pca, self.norm, self.main_network, self.device, self.use_amp_finetuning,
                                  self.do_retrieval, X_ctxt_superset, y_ctxt_superset,
                                  self.retrieval_alpha, self.retrieval_temperature, self.retrieval_distance_type,
                                  training_finetuning=training, finetuning_dropout=self.finetuning_dropout,
-                                 query_ids=query_ids, context_ids_superset=context_ids_superset)
+                                 query_ids=query_ids, context_ids_superset=context_ids_superset,
+                                 query_context_positions=query_context_positions)
 
     def get_main_network_parts(self):
 
@@ -1053,7 +1071,9 @@ def fine_tune_main_network(
             X_ctxt_superset = X_train.to(device)
             y_ctxt_superset = y_train.to(device)
             context_ids_superset = train_ids.to(device)
-            if device.type == "cuda" and X_train.device.type == y_train.device.type == "cpu":
+            if len(X_train) <= batch_size or (
+                device.type == "cuda" and X_train.device.type == y_train.device.type == "cpu"
+            ):
                 train_context_positions = torch.arange(len(X_train), device="cpu")
     else:
         X_ctxt_superset = None
@@ -1242,9 +1262,15 @@ def fine_tune_main_network(
 
             step_t0 = time.time()  # NEW
 
+            query_context_positions = None
             if train_context_positions is not None:
+                positions = batch[0]
+                if len(positions) == len(X_ctxt_superset):
+                    # The batch is a permutation of the complete context, including bootstrap duplicates.
+                    positions = positions.to(device, non_blocking=positions.is_pinned())
+                    query_context_positions = positions
                 inputs, targets, query_ids = _gather_tensor_batch(
-                    (X_ctxt_superset, y_ctxt_superset, context_ids_superset), batch[0], device
+                    (X_ctxt_superset, y_ctxt_superset, context_ids_superset), positions, device
                 )
             else:
                 inputs, targets, query_ids = _move_tensor_batch(batch, device)
@@ -1257,6 +1283,8 @@ def fine_tune_main_network(
                         query_ids=query_ids,
                         context_ids_superset=context_ids_superset,
                     )
+                    if query_context_positions is not None:
+                        forward_kwargs["query_context_positions"] = query_context_positions
                 outputs = main_model(
                     inputs,
                     X_ctxt_superset,
