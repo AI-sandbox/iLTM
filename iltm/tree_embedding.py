@@ -262,6 +262,29 @@ class TreeEmbedding:
 
         return X
 
+    def _make_xgboost_dmatrix(
+        self,
+        X: pd.DataFrame,
+        y: np.ndarray | pd.Series | None = None,
+    ) -> xgb.DMatrix:
+        """Use XGBoost's dense array path for homogeneous native float columns."""
+        dtypes = X.dtypes.unique()
+        if (
+            len(dtypes) == 1
+            and isinstance(dtypes[0], np.dtype)
+            and dtypes[0] in (np.dtype("float32"), np.dtype("float64"))
+            and X.columns.is_unique
+            and not isinstance(X.columns, pd.MultiIndex)
+        ):
+            return xgb.DMatrix(
+                X.to_numpy(copy=False),
+                y,
+                feature_names=list(X.columns.map(str)),
+                feature_types=["float"] * X.shape[1],
+                nthread=self.n_jobs,
+            )
+        return xgb.DMatrix(X, y, enable_categorical=True, nthread=self.n_jobs)
+
     def _split_internal_validation(
         self, X: pd.DataFrame, y: np.ndarray | pd.Series,
     ) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.Series, pd.Series | None]:
@@ -407,11 +430,11 @@ class TreeEmbedding:
                 params['max_bin'] = max(64, int(params.get('max_bin', 256) // 2))
 
             X = self._handle_inf_and_value_too_large(X)
-            dtrain = xgb.DMatrix(X, y, enable_categorical=True, nthread=self.n_jobs)
+            dtrain = self._make_xgboost_dmatrix(X, y)
 
             if X_val is not None:
                 X_val = self._handle_inf_and_value_too_large(X_val)
-                dval = xgb.DMatrix(X_val, y_val, enable_categorical=True, nthread=self.n_jobs)
+                dval = self._make_xgboost_dmatrix(X_val, y_val)
                 evals = [(dtrain, 'train'), (dval, 'valid')]
             else:
                 dval = None
@@ -651,7 +674,7 @@ class TreeEmbedding:
             if self._is_gpu_device() and padding_rows:
                 # Fill the final GPU block so XGBoost initializes every missing-value slot.
                 X = pd.concat([X, X.iloc[[0] * padding_rows]], ignore_index=True)
-            dtest = xgb.DMatrix(X, enable_categorical=True, nthread=self.n_jobs)
+            dtest = self._make_xgboost_dmatrix(X)
             predict_kwargs = {}
             if self.select_best_model:
                 best_iteration = getattr(self.model, 'best_iteration', None)
@@ -913,7 +936,7 @@ class TreeEmbedding:
         if self.tree_model in ['GB']:
             raw_preds = self.model.predict(X_prepared)
         elif self.tree_model in ['XGBoost_approx', 'XGBoost_hist']:
-            dmat = xgb.DMatrix(X_prepared, enable_categorical=True, nthread=self.n_jobs)
+            dmat = self._make_xgboost_dmatrix(X_prepared)
             raw_preds = self.model.predict(dmat)
         elif self.tree_model == 'CatBoost':
             X_prepared = preprocess_cat_features_for_catboost(X_prepared, self.cat_features)
