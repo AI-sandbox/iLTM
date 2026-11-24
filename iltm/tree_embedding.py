@@ -256,6 +256,8 @@ class TreeEmbedding:
 
         # 2. Cap large numeric values
         numeric_cols = X.select_dtypes(include=[np.number]).columns
+        if len(numeric_cols) == X.shape[1]:
+            return X.clip(-cap_threshold, cap_threshold)
         X[numeric_cols] = X[numeric_cols].clip(-cap_threshold, cap_threshold)
 
         return X
