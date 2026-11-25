@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 _DENSE_ONEHOT_WORKING_SET_BYTES = 64 * 1024**2
+_XGBoostFitCache = dict[tuple, tuple[xgb.DMatrix, xgb.DMatrix | None, pd.DataFrame]]
 
 
 @contextmanager
@@ -286,6 +287,24 @@ class TreeEmbedding:
             )
         return xgb.DMatrix(X, y, enable_categorical=True, nthread=self.n_jobs)
 
+    def _xgboost_fit_matrices(self, X, y, X_val, y_val, cache, device):
+        if cache is not None:
+            key = (tuple(self.cat_features or ()), self.n_jobs, self.select_best_model, device)
+            if key in cache:
+                return cache[key]
+            cache.clear()
+
+        X = self._handle_inf_and_value_too_large(X)
+        dtrain = self._make_xgboost_dmatrix(X, y)
+        dval = None
+        if X_val is not None:
+            dval = self._make_xgboost_dmatrix(self._handle_inf_and_value_too_large(X_val), y_val)
+        if cache is not None:
+            # Sparse leaf prediction needs only the sanitized column names and dtypes.
+            X = X.iloc[:0].copy()
+            cache[key] = dtrain, dval, X
+        return dtrain, dval, X
+
     def _split_internal_validation(
         self, X: pd.DataFrame, y: np.ndarray | pd.Series,
     ) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.Series, pd.Series | None]:
@@ -323,7 +342,10 @@ class TreeEmbedding:
         train_idx = np.concatenate([train_idx, np.flatnonzero(~repeated)])
         return X.iloc[train_idx], X.iloc[val_idx], y.iloc[train_idx], y.iloc[val_idx]
 
-    def _fit_model(self, X: pd.DataFrame, y: np.ndarray | pd.Series, eval_set: tuple = None) -> None:
+    def _fit_model(
+        self, X: pd.DataFrame, y: np.ndarray | pd.Series, eval_set: tuple = None,
+        *, xgb_fit_cache: _XGBoostFitCache | None = None,
+    ) -> None:
         """
         Fits the tree-based model based on the specified type.
 
@@ -392,6 +414,9 @@ class TreeEmbedding:
 
         # Now fit the chosen model
         if self.tree_model in ['XGBoost_approx', 'XGBoost_hist']:
+            # Approximate splits can change when another booster has already used the matrix.
+            if self.tree_model != 'XGBoost_hist' or (self.select_best_model and eval_set is None):
+                xgb_fit_cache = None
             params = {
                 'tree_method': 'hist' if self.tree_model == 'XGBoost_hist' else 'approx',
                 'seed': self.seed,
@@ -427,19 +452,15 @@ class TreeEmbedding:
 
             # conservative max_bin when VRAM is tight
             info = get_gpu_memory_info()
+            if info and info["free_mb"] < 1024 and xgb_fit_cache:
+                xgb_fit_cache.clear()
+                info = get_gpu_memory_info()
             if info and info["free_mb"] < 1024:
+                xgb_fit_cache = None
                 params['max_bin'] = max(64, int(params.get('max_bin', 256) // 2))
 
-            X = self._handle_inf_and_value_too_large(X)
-            dtrain = self._make_xgboost_dmatrix(X, y)
-
-            if X_val is not None:
-                X_val = self._handle_inf_and_value_too_large(X_val)
-                dval = self._make_xgboost_dmatrix(X_val, y_val)
-                evals = [(dval, 'valid')]
-            else:
-                dval = None
-                evals = None
+            dtrain, dval, X = self._xgboost_fit_matrices(X, y, X_val, y_val, xgb_fit_cache, params['device'])
+            evals = [(dval, 'valid')] if dval is not None else None
 
             num_rounds = int(self.n_estimators or 100)
             max_attempts = 16
@@ -460,6 +481,8 @@ class TreeEmbedding:
                 except Exception as e:
                     if not is_cuda_oom(e):
                         raise
+                    if xgb_fit_cache is not None:
+                        xgb_fit_cache.clear()
                     logger.warning("XGBoost OOM on attempt %d. Adapting and retrying.", attempt)
                     clear_cuda_cache()
                     if attempt == max_attempts:
@@ -850,6 +873,8 @@ class TreeEmbedding:
         y: np.ndarray,
         eval_set: tuple = None,
         concat_with_orig_features: bool = True,
+        *,
+        xgb_fit_cache: _XGBoostFitCache | None = None,
     ) -> np.ndarray:
         if (
             getattr(self.fit_tree, "__func__", None) is not _TREE_EMBEDDING_FIT_TREE
@@ -862,7 +887,7 @@ class TreeEmbedding:
                 concat_with_orig_features=concat_with_orig_features,
             )
             return self.transform(X)
-        embeddings = self._fit_tree(X, y, eval_set, concat_with_orig_features)
+        embeddings = self._fit_tree(X, y, eval_set, concat_with_orig_features, xgb_fit_cache=xgb_fit_cache)
         return self._encode_embeddings(embeddings)
 
     def _fit_tree(
@@ -871,6 +896,8 @@ class TreeEmbedding:
         y: np.ndarray,
         eval_set: tuple = None,
         concat_with_orig_features: bool = True,
+        *,
+        xgb_fit_cache: _XGBoostFitCache | None = None,
     ) -> np.ndarray:
         """Fit the tree and encoder, returning the training leaf matrix."""
         logger.info(f"Fitting tree model: {self.tree_model}")
@@ -882,7 +909,10 @@ class TreeEmbedding:
         X_encoded = self._handle_categorical_features(X, fit=True)
 
         # Fit the tree-based model
-        self._fit_model(X_encoded, y, eval_set)
+        if xgb_fit_cache is None:
+            self._fit_model(X_encoded, y, eval_set)
+        else:
+            self._fit_model(X_encoded, y, eval_set, xgb_fit_cache=xgb_fit_cache)
 
         # Get embeddings
         emb = self._get_embeddings(X_encoded)

@@ -2179,6 +2179,12 @@ class _iLTMBase(BaseEstimator):
                 _AUTO_VAL_CHECKS_SMALL_TRAIN_MAX_ROWS,
             )
 
+        tree_models = [
+            cfg["tree_model"] if cfg["tree_embedding"] else None for cfg in self._checkpoint_mix_configs
+        ] or [self.tree_model if self.tree_embedding else None]
+        xgb_members = [i for i in range(self.n_ensemble) if tree_models[i % len(tree_models)] == "XGBoost_hist"]
+        xgb_fit_cache = {}
+
         # Generate predictors
         for i in range(self.n_ensemble):
             current_time = time.time()
@@ -2210,6 +2216,9 @@ class _iLTMBase(BaseEstimator):
                         break
 
             stop_for_memory, memory_details = self._should_stop_for_cpu_memory_before_predictor(i + 1)
+            if stop_for_memory and xgb_fit_cache:
+                xgb_fit_cache.clear()
+                stop_for_memory, memory_details = self._should_stop_for_cpu_memory_before_predictor(i + 1)
             if stop_for_memory and memory_details is not None:
                 logger.warning(
                     "Early return: CPU memory budget nearly exhausted before predictor %d. "
@@ -2278,12 +2287,24 @@ class _iLTMBase(BaseEstimator):
                     if fit_deadline_reached(fit_deadline):
                         break
                     if X_tree is X_for_nn and hasattr(tree, "_fit_transform_training"):
+                        reuse_xgb = (
+                            len(xgb_members) > 1 and i in xgb_members and X_tree is X_original and y_tree is y_proc
+                        )
                         X_emb_tr = tree._fit_transform_training(
                             X_tree,
                             y_tree,
                             eval_set=tree_eval_set,
                             concat_with_orig_features=predictor_concat,
+                            xgb_fit_cache=xgb_fit_cache if reuse_xgb else None,
                         )
+                        if xgb_fit_cache and (
+                            i == xgb_members[-1]
+                            or (
+                                self.device.type == "cuda"
+                                and torch.cuda.mem_get_info(self.device)[0] < self.gpu_mem_low_mb * 1024**2
+                            )
+                        ):
+                            xgb_fit_cache.clear()
                     else:
                         tree.fit_tree(
                             X_tree,
