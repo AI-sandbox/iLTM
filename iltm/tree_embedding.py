@@ -646,8 +646,36 @@ class TreeEmbedding:
             if eval_pool is not None:
                 del eval_pool
             gc.collect()
+            self._catboost_leaf_layout = self._catboost_used_columns(X)
         else:
             raise ValueError(f"Unknown tree-based model: {self.tree_model}")
+
+    def _catboost_used_columns(self, X: pd.DataFrame) -> tuple[pd.Index, np.ndarray] | None:
+        if X.shape[1] < 256 or isinstance(X.columns, pd.MultiIndex):
+            return None
+        names = X.columns.map(str)
+        if not names.is_unique or "" in names or not names.equals(pd.Index(self.model.feature_names_)):
+            return None
+        compact = self.model.copy()
+        compact.drop_unused_features()
+        required = names.isin(compact.feature_names_)
+        required[self.cat_features] = True
+        if not required.any() or required.sum() * 8 > len(names):
+            return None
+        return names, required
+
+    def _catboost_leaf_pool(self, X: pd.DataFrame) -> Pool:
+        cat_features = self.cat_features
+        layout = getattr(self, "_catboost_leaf_layout", None)
+        if layout is not None and X.columns.map(str).equals(layout[0]):
+            # Keep columns with nonstandard values for CatBoost's usual input validation.
+            numeric = X.dtypes.map(lambda d: isinstance(d, np.dtype) and d.kind in "biuf" and d.itemsize <= 8)
+            positions = np.flatnonzero(layout[1] | ~numeric.to_numpy())
+            if len(positions) * 8 <= X.shape[1]:
+                X = X.iloc[:, positions]
+                cat_features = np.flatnonzero(np.isin(positions, cat_features)).tolist()
+        X = preprocess_cat_features_for_catboost(X.copy(deep=False), cat_features)
+        return Pool(X, cat_features=cat_features, thread_count=self.n_jobs)
 
     def _xgboost_leaf_end(self) -> int:
         best = getattr(self.model, "best_iteration", None) if self.select_best_model else None
@@ -726,8 +754,7 @@ class TreeEmbedding:
             emb = self._xgboost_leaf_ids(X)
 
         elif self.tree_model == 'CatBoost':
-            X = preprocess_cat_features_for_catboost(X, self.cat_features)
-            test_pool = Pool(X, cat_features=self.cat_features, thread_count=self.n_jobs)
+            test_pool = self._catboost_leaf_pool(X)
             leaf_kwargs = {}
             if self.select_best_model:
                 best_iteration = self.model.get_best_iteration()
@@ -931,7 +958,9 @@ class TreeEmbedding:
         logger.info(f"Transforming data using tree model: {self.tree_model}")
         
         # Handle categorical features
-        if getattr(self, "_sparse_leaf_layout", None) is not None and not self.cat_features:
+        if self.tree_model == 'CatBoost' or (
+            getattr(self, "_sparse_leaf_layout", None) is not None and not self.cat_features
+        ):
             X_encoded = pd.DataFrame(X, copy=False)
         else:
             X_encoded = self._handle_categorical_features(X, fit=False)
