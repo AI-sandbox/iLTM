@@ -159,3 +159,56 @@ def test_prediction_failure_restores_predictor_to_cpu(monkeypatch, chunked):
 
     assert moves == ["device", "cpu"]
     assert estimator.predictors_[0]["probe_device"] == "cpu"
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("storage_dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_inference_restores_original_rf_weight(device, storage_dtype):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    estimator = iLTMRegressor(checkpoint=None, device=device, inference_storage_dtype=storage_dtype)
+    layer = torch.nn.Linear(3, 4, bias=False).to(storage_dtype)
+    rf = torch.nn.Sequential(layer, torch.nn.ReLU())
+    predictor = {"rf": rf}
+    original = layer.weight
+    stored_pointer = original.data_ptr()
+    x = torch.tensor([[1., -2., 3.]], device=device)
+    expected = torch.nn.functional.linear(x, original.detach().to(x)).relu()
+
+    for fail in (False, True):
+        def run():
+            with estimator._predictor_on_device(predictor):
+                assert layer.weight.dtype == torch.float32
+                assert layer.weight.device == x.device
+                torch.testing.assert_close(rf(x), expected, rtol=0, atol=0)
+                if fail:
+                    raise RuntimeError("interrupted prediction")
+
+        if fail:
+            with pytest.raises(RuntimeError, match="interrupted prediction"):
+                run()
+        else:
+            run()
+        assert layer.weight is original
+        assert layer.weight.data_ptr() == stored_pointer
+        assert layer.weight.dtype == storage_dtype
+
+
+def test_failed_device_transfer_restores_original_rf_weight(monkeypatch):
+    estimator = iLTMRegressor(checkpoint=None, device="cpu", inference_storage_dtype="float16")
+    layer = torch.nn.Linear(3, 4, bias=False).half()
+    predictor = {"rf": torch.nn.Sequential(layer)}
+    original = layer.weight
+    move = estimator._move_predictor_to_device
+
+    def fail_after_move(predictor, device=None):
+        move(predictor, device)
+        assert layer.weight.dtype == torch.float32
+        raise RuntimeError("interrupted transfer")
+
+    monkeypatch.setattr(estimator, "_move_predictor_to_device", fail_after_move)
+    with pytest.raises(RuntimeError, match="interrupted transfer"):
+        with estimator._predictor_on_device(predictor):
+            pytest.fail("transfer should have failed before prediction")
+    assert layer.weight is original
+    assert layer.weight.dtype == torch.float16

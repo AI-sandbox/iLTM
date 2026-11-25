@@ -4,7 +4,7 @@ import os
 import gc
 import math
 import logging
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from functools import wraps
 from numbers import Integral
 from threading import RLock
@@ -1517,6 +1517,28 @@ class _iLTMBase(BaseEstimator):
 
         return X_pred, y_pred, feature_idxs
 
+    @contextmanager
+    def _predictor_on_device(self, predictor: dict):
+        rf = predictor.get("rf")
+        layer = rf[0] if isinstance(rf, nn.Sequential) and len(rf) else None
+        stored_weight = None
+        if (
+            isinstance(layer, nn.Linear)
+            and layer.weight.device.type == "cpu"
+            and layer.weight.dtype == (self._inference_storage_torch_dtype or torch.float32)
+            and (self.device.type != "cpu" or layer.weight.dtype != torch.float32)
+        ):
+            # Move a temporary parameter so the fitted CPU storage survives the forward pass.
+            stored_weight = layer.weight
+            layer.weight = nn.Parameter(stored_weight.detach(), requires_grad=stored_weight.requires_grad)
+        try:
+            predictor = self._move_predictor_to_device(predictor, device=self.device)
+            yield predictor
+        finally:
+            if stored_weight is not None:
+                layer.weight = stored_weight
+            self._move_predictor_to_cpu(predictor)
+
     def _move_predictor_to_device(self, predictor: dict, device: str | torch.device | None = None) -> dict:
         if device is None:
             device = self.device
@@ -1712,11 +1734,7 @@ class _iLTMBase(BaseEstimator):
         retrieval_context_cache: dict[str, tuple[Tensor, Tensor]] | None = None,
     ) -> Tensor | tuple[Tensor, Tensor]:
         if manage_predictor_device:
-            try:
-                predictor = self._move_predictor_to_device(
-                    predictor,
-                    device=self.device,
-                )
+            with self._predictor_on_device(predictor) as predictor:
                 return self._forward_pass_predictor(
                     predictor,
                     X,
@@ -1725,8 +1743,6 @@ class _iLTMBase(BaseEstimator):
                     return_retrieval_components=return_retrieval_components,
                     retrieval_context_cache=retrieval_context_cache,
                 )
-            finally:
-                self._move_predictor_to_cpu(predictor)
 
         feature_bagging_idxs = predictor['feature_bagging_idxs']
         rf = predictor['rf']
@@ -2513,11 +2529,9 @@ class _iLTMBase(BaseEstimator):
                 outs_chunks: List[Tensor] = []
                 retrieval_outs_chunks: List[Tensor] = []
                 retrieval_context_cache: dict[str, tuple[Tensor, Tensor]] = {}
-                try:
-                    predictor = self._move_predictor_to_device(
-                        predictor,
-                        device=self.device,
-                    )
+                with ExitStack() as cleanup:
+                    predictor = cleanup.enter_context(self._predictor_on_device(predictor))
+                    cleanup.callback(retrieval_context_cache.clear)
                     for start in range(0, n_samples, chunk_rows):
                         end = min(start + chunk_rows, n_samples)
                         if alpha_validation_inputs is not None:
@@ -2558,9 +2572,6 @@ class _iLTMBase(BaseEstimator):
                             elif softmax_per_predictor:
                                 out = F.softmax(out, dim=1)
                             outs_chunks.append(out)
-                finally:
-                    retrieval_context_cache.clear()
-                    self._move_predictor_to_cpu(predictor)
 
                 outputs = torch.cat(outs_chunks, dim=0)
                 if return_retrieval_components:
