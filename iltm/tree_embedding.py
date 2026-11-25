@@ -436,7 +436,7 @@ class TreeEmbedding:
             if X_val is not None:
                 X_val = self._handle_inf_and_value_too_large(X_val)
                 dval = self._make_xgboost_dmatrix(X_val, y_val)
-                evals = [(dtrain, 'train'), (dval, 'valid')]
+                evals = [(dval, 'valid')]
             else:
                 dval = None
                 evals = None
