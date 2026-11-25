@@ -280,6 +280,58 @@ def test_serialization_excludes_training_model_and_preserves_predictions():
     np.testing.assert_allclose(predictions_after, predictions_before)
 
 
+@pytest.mark.parametrize("model_cls", [iLTMClassifier, iLTMRegressor])
+def test_zero_validation_alpha_discards_retrieval_and_preserves_predictions(model_cls, monkeypatch):
+    model = model_cls(
+        checkpoint=None, device="cpu", tree_embedding=False, preprocessing="none", n_dims=2,
+        corr_select_k=0, do_retrieval=True, use_amp_inference=True,
+    )
+    regression = model_cls is iLTMRegressor
+    model.n_outputs_ = 1 if regression else 2
+    model.preprocessors_ = [{}]
+    model.predictors_ = [_predictor(), _predictor()]
+    if regression:
+        model.clip_predictions_ = model.normalize_predictions_ = False
+        model._y_mean, model._y_std = 0.0, 1.0
+    else:
+        model.finetuning_classification_val_metric = "logloss"
+    X = np.array([[0.1, 0.7], [0.3, 1.9], [0.8, 1.3]], dtype=np.float32)
+    for i, predictor in enumerate(model.predictors_):
+        predictor["retrieval_parameters"]["do_retrieval"] = True
+        context = torch.from_numpy(X).repeat(100, 1)
+        predictor["X_ctxt_superset"] = context if i == 0 else {"x_num": context[:, :1], "x_cat": context[:, 1:]}
+        predictor["y_ctxt_superset"] = torch.ones(len(context), dtype=torch.long)
+        if regression:
+            predictor["main_network"][-1] = torch.nn.Linear(2, 1).requires_grad_(False)
+            predictor["y_ctxt_superset"] = torch.full((len(context),), 50.0)
+
+    def predict(estimator, data):
+        return estimator.predict(data) if regression else estimator.predict_proba(data)
+
+    # These predictors have zero mixing weight but still have their original contexts.
+    query = X + np.float32(0.17)
+    expected = predict(model, query)
+    original_size = len(pickle.dumps(model))
+    assert len(model._retrieval_contexts) == 2
+    y = np.full(len(X), -100.0) if regression else np.zeros(len(X), dtype=int)
+    model._fit_adaptive_retrieval_alpha(X, y, n_outputs=model.n_outputs_)
+    assert model.retrieval_alpha_ == 0.0
+    assert model.use_amp_inference
+    assert "_retrieval_contexts" not in vars(model)
+    for predictor in model.predictors_:
+        assert predictor["X_ctxt_superset"] is None and predictor["y_ctxt_superset"] is None
+
+    def unexpected_retrieval(*args, **kwargs):
+        pytest.fail("Prediction used retrieval after validation selected zero weight")
+
+    monkeypatch.setattr("iltm.inference_interface.prepare_retrieval_context", unexpected_retrieval)
+    monkeypatch.setattr("iltm.utils.retrieval", unexpected_retrieval)
+    saved = pickle.dumps(model)
+    assert len(saved) < original_size
+    for estimator in (model, pickle.loads(saved)):
+        assert predict(estimator, query).tobytes() == expected.tobytes()
+
+
 def test_unpickled_estimator_can_log_in_fresh_process(tmp_path):
     classifier = iLTMClassifier(
         checkpoint=None,

@@ -1755,6 +1755,10 @@ class _iLTMBase(BaseEstimator):
         retrieval_alpha = predictor['retrieval_parameters']['retrieval_alpha']
         retrieval_temperature = predictor['retrieval_parameters']['retrieval_temperature']
         retrieval_distance = predictor['retrieval_parameters']['retrieval_distance']
+        # Retrieval uses full precision, including when validation discards its context.
+        use_amp = self.use_amp_inference and not do_retrieval
+        if X_ctxt_superset is None and retrieval_alpha == 0.0:
+            do_retrieval = False
 
         if isinstance(X, dict):
             if X_ctxt_superset is not None:
@@ -1822,7 +1826,7 @@ class _iLTMBase(BaseEstimator):
                         n_outputs,
                         bs,
                         model_cfg,
-                        rf, pca, norm, main_network, self.device, self.use_amp_inference,
+                        rf, pca, norm, main_network, self.device, use_amp,
                         do_retrieval, X_ctxt_superset, y_ctxt_superset,
                         retrieval_alpha, retrieval_temperature, retrieval_distance,
                         prepared_retrieval_context=prepared_retrieval_context,
@@ -2749,6 +2753,11 @@ class _iLTMBase(BaseEstimator):
         self.retrieval_alpha_ = float(selected_alpha)
         for predictor in self.predictors_:
             predictor["retrieval_parameters"]["retrieval_alpha"] = self.retrieval_alpha_
+        if self.retrieval_alpha_ == 0.0:
+            for predictor in self.predictors_:
+                predictor["X_ctxt_superset"] = None
+                predictor["y_ctxt_superset"] = None
+            self.__dict__.pop("_retrieval_contexts", None)
         logger.info(
             "Adaptive retrieval alpha selected %.6f using validation %s %.8f.",
             self.retrieval_alpha_,

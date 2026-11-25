@@ -28,7 +28,8 @@ def test_adaptive_retrieval_alpha_is_default():
     assert model.retrieval_alpha_adaptive is True
 
 
-def test_adaptive_retrieval_alpha_regression(monkeypatch):
+@pytest.mark.parametrize("weight", [1.0, 1e-8])
+def test_adaptive_retrieval_alpha_regression(monkeypatch, weight):
     model = iLTMRegressor(
         checkpoint=None,
         device="cpu",
@@ -37,6 +38,9 @@ def test_adaptive_retrieval_alpha_regression(monkeypatch):
     )
     model.clip_predictions_ = False
     model.predictors_ = _predictors(2)
+    context = torch.ones((4, 1))
+    for predictor in model.predictors_:
+        predictor["X_ctxt_superset"] = context
     main = torch.zeros((2, 4))
     retrieval = torch.tensor(
         [
@@ -52,13 +56,14 @@ def test_adaptive_retrieval_alpha_regression(monkeypatch):
 
     model._fit_adaptive_retrieval_alpha(
         np.zeros((4, 1)),
-        np.arange(4, dtype=np.float32),
+        weight * np.arange(4, dtype=np.float64),
         n_outputs=1,
     )
 
-    assert model.retrieval_alpha_ == pytest.approx(1.0)
+    assert model.retrieval_alpha_ == pytest.approx(weight)
     assert all(
-        predictor["retrieval_parameters"]["retrieval_alpha"] == pytest.approx(1.0)
+        predictor["retrieval_parameters"]["retrieval_alpha"] == pytest.approx(weight)
+        and predictor["X_ctxt_superset"] is context
         for predictor in model.predictors_
     )
 
