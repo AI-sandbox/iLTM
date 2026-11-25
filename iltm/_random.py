@@ -11,7 +11,8 @@ from torch.nn import functional as F
 
 
 class _FitGenerators:
-    def __init__(self, seed: int):
+    def __init__(self, seed: int, rf_storage_dtype: torch.dtype | None):
+        self.rf_storage_dtype = rf_storage_dtype
         self.seed = seed
         self.numpy = np.random.RandomState(seed)  # scikit-learn accepts RandomState
         self.by_device: dict[torch.device, torch.Generator] = {}
@@ -23,12 +24,17 @@ _active: ContextVar[_FitGenerators | None] = ContextVar("iltm_fit_generators", d
 
 
 @contextmanager
-def fit_random_generators(seed: int):
-    token = _active.set(_FitGenerators(seed))
+def fit_random_generators(seed: int, *, rf_storage_dtype: torch.dtype | None = None):
+    token = _active.set(_FitGenerators(seed, rf_storage_dtype))
     try:
         yield
     finally:
         _active.reset(token)
+
+
+def rf_storage_dtype() -> torch.dtype | None:
+    generators = _active.get()
+    return generators.rf_storage_dtype if generators is not None else None
 
 
 def numpy_random_state() -> np.random.RandomState | None:

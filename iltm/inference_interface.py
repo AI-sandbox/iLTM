@@ -2978,7 +2978,7 @@ class iLTMRegressor(RegressorMixin, PermutationImportanceMixin, _iLTMBase):
         
         alpha_validation_inputs = [] if self.retrieval_alpha_adaptive and self.do_retrieval else None
         try:
-            with fit_random_generators(self.seed):
+            with fit_random_generators(self.seed, rf_storage_dtype=self._inference_storage_torch_dtype):
                 result = self._fit_common(
                     X, y_proc,
                     eval_set=eval_set_proc,
@@ -3359,7 +3359,7 @@ class iLTMClassifier(ClassifierMixin, PermutationImportanceMixin, _iLTMBase):
 
         alpha_validation_inputs = [] if self.retrieval_alpha_adaptive and self.do_retrieval else None
         try:
-            with fit_random_generators(self.seed):
+            with fit_random_generators(self.seed, rf_storage_dtype=self._inference_storage_torch_dtype):
                 result = self._fit_common(
                     X, y_proc,
                     eval_set=eval_set,
