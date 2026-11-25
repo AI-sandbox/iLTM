@@ -20,6 +20,15 @@ def test_categorical_detection_handles_pandas_string_dtype():
     assert detect_object_string_columns(X) == [0, 1]
 
 
+@pytest.mark.parametrize("X", [
+    np.arange(6).reshape(2, 3),
+    pd.DataFrame({"signed": [-1, 2], "unsigned": np.array([0, 1], dtype=np.uint32), "float": [np.nan, 0.5]}),
+])
+def test_numeric_detection_preserves_explicit_categories(X):
+    assert detect_object_string_columns(X) == []
+    assert detect_object_string_columns(X, cat_features=[2, 0, 2]) == [0, 2]
+
+
 @pytest.mark.parametrize("checkpoint_name", ["cbrconcat", "rtr"])
 def test_pandas_category_dtype_reaches_checkpoint_preprocessing(monkeypatch, tmp_path, checkpoint_name):
     checkpoint = tmp_path / f"{checkpoint_name}.pth"

@@ -2002,7 +2002,10 @@ def detect_object_string_columns(X: np.ndarray | pd.DataFrame, cat_features: lis
         df = X
     else:
         df = pd.DataFrame(X)
-    
+
+    if all(isinstance(dtype, np.dtype) and dtype.kind in "iuf" for dtype in df.dtypes.unique()):
+        return sorted(detected_cat_features)
+
     for col_idx, col_name in enumerate(df.columns):
         if col_idx in detected_cat_features:
             continue
