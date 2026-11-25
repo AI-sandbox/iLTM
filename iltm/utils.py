@@ -119,6 +119,25 @@ def _centered_lowrank_svd(X: Tensor, mean: Tensor, rank: int):
     return (Vt.mT, S, U.mT) if wide else (U, S, Vt)
 
 
+def _pack_pca_basis(basis: Tensor, state: dict) -> Tensor:
+    if basis.untyped_storage().nbytes() <= basis.nbytes or basis.numel() == 0:
+        return basis
+    # Slicing the SVD output can keep the storage of every discarded component.
+    state["_pca_basis_layout"] = (basis.stride(), basis.storage_offset())
+    return basis.detach().clone(memory_format=torch.contiguous_format).requires_grad_(basis.requires_grad)
+
+
+def _restore_pca_basis(basis: Tensor, layout: tuple) -> Tensor:
+    strides, offset = layout
+    if basis.stride() == strides and offset == 0:
+        return basis
+    # Keep the original matrix layout so prediction uses the same matmul layout.
+    storage_size = offset + 1 + sum((n - 1) * s for n, s in zip(basis.shape, strides))
+    restored = basis.new_zeros((storage_size,)).as_strided(basis.shape, strides, offset)
+    restored.copy_(basis.detach())
+    return restored.requires_grad_(basis.requires_grad)
+
+
 class TorchPCA:
     def __init__(self, n_components=None, fit="reduced", svd_driver=None):
         self.n_components = n_components
@@ -126,6 +145,18 @@ class TorchPCA:
         if fit == "lowrank" and svd_driver is not None:
             logger.warning("svd_driver is not used in 'lowrank' fit mode.")
         self.svd_driver = svd_driver
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        if "components_" in state:
+            state["components_"] = _pack_pca_basis(self.components_, state)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        layout = self.__dict__.pop("_pca_basis_layout", None)
+        if layout is not None:
+            self.components_ = _restore_pca_basis(self.components_, layout)
 
     def _fit(self, X):
         n_samples, n_features = X.shape
@@ -571,6 +602,23 @@ class PCAModule(nn.Module):
             self.input_features, self.output_features, bias=False, device="meta"
         )
         self.pca_components.weight = (nn.Parameter(pca.components_))
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        layer = self.pca_components
+        packed = _pack_pca_basis(layer.weight, state)
+        if packed is not layer.weight:
+            saved_layer = copy.copy(layer)
+            saved_layer._parameters = {**layer._parameters, "weight": nn.Parameter(packed, packed.requires_grad)}
+            state["_modules"] = {**state["_modules"], "pca_components": saved_layer}
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        layout = self.__dict__.pop("_pca_basis_layout", None)
+        if layout is not None:
+            weight = self.pca_components.weight
+            self.pca_components.weight = nn.Parameter(_restore_pca_basis(weight, layout), weight.requires_grad)
 
     def transform(self, X):
         with torch.amp.autocast(device_type=X.device.type, enabled=False):
