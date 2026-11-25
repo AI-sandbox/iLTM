@@ -45,6 +45,7 @@ dependencies = [
     "openml>=0.15.1",
     "pandas>=2.3.3",
     "scikit-learn>=1.6",
+    "scipy",
     "torch>=2.8.0",
     "xgboost>=3.0.5",
     "huggingface_hub>=0.20",

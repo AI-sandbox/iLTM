@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from functools import partial
 import numpy as np
 import pandas as pd
+from scipy.sparse import csr_matrix
 from sklearn.feature_selection import f_classif, f_regression
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OrdinalEncoder, OneHotEncoder
@@ -493,6 +494,7 @@ class TreeEmbedding:
 
                     raise
 
+            self._sparse_leaf_layout = self._xgboost_sparse_leaf_layout(X)
             del dtrain
             if dval is not None:
                 del dval
@@ -647,6 +649,60 @@ class TreeEmbedding:
         else:
             raise ValueError(f"Unknown tree-based model: {self.tree_model}")
 
+    def _xgboost_leaf_end(self) -> int:
+        best = getattr(self.model, "best_iteration", None) if self.select_best_model else None
+        return 0 if best is None else int(best) + 1
+
+    def _xgboost_sparse_leaf_layout(self, X: pd.DataFrame) -> tuple[int, list[str], np.ndarray] | None:
+        """Keep split positions only when a wide numeric table benefits from sparse leaf prediction."""
+        if X.shape[1] < 256 or self.cat_features or isinstance(X.columns, pd.MultiIndex):
+            return None
+        if not all(dtype in (np.dtype("float32"), np.dtype("float64")) for dtype in X.dtypes.unique()):
+            return None
+        end = self._xgboost_leaf_end()
+        names = self.model.feature_names
+        if names is None:
+            return None
+        retained = self.model
+        if end and end < self.model.num_boosted_rounds():
+            retained = self.model[:end]
+            retained.feature_names = names
+        splits = retained.get_score(importance_type="weight")
+        if not splits or len(splits) * 8 > X.shape[1]:
+            return None
+        indices = np.array([i for i, name in enumerate(names) if name in splits], dtype=np.int32)
+        return end, names, indices
+
+    def _xgboost_leaf_ids(self, X: pd.DataFrame) -> np.ndarray:
+        end = self._xgboost_leaf_end()
+        layout = getattr(self, "_sparse_leaf_layout", None)
+        sparse = (
+            layout is not None and layout[0] == end and not self.cat_features
+            and not isinstance(X.columns, pd.MultiIndex)
+            and X.columns.map(str).tolist() == layout[1]
+            and all(dtype in (np.dtype("float32"), np.dtype("float64")) for dtype in X.dtypes.unique())
+        )
+        n_rows, n_features = X.shape
+        if sparse:
+            indices = layout[2]
+            X = X.iloc[:, indices]
+        X = self._handle_inf_and_value_too_large(X)
+        padding_rows = (-n_rows) % 128
+        if self._is_gpu_device() and padding_rows:
+            # Fill the final GPU block so XGBoost initializes every missing-value slot.
+            X = pd.concat([X, X.iloc[[0] * padding_rows]], ignore_index=True)
+        if sparse:
+            # Store explicit zeros: an omitted CSR entry is missing to XGBoost.
+            matrix = csr_matrix(
+                (X.to_numpy(dtype=np.float32).ravel(), np.tile(indices, len(X)),
+                 np.arange(len(X) + 1, dtype=np.int64) * len(indices)),
+                shape=(len(X), n_features),
+            )
+            dtest = xgb.DMatrix(matrix, nthread=self.n_jobs)
+        else:
+            dtest = self._make_xgboost_dmatrix(X)
+        return self.model.predict(dtest, pred_leaf=True, iteration_range=(0, end), validate_features=not sparse)[:n_rows]
+
     def _get_embeddings(self, X: pd.DataFrame) -> np.ndarray:
         """
         Transforms the data into embeddings using the fitted tree-based model.
@@ -667,20 +723,7 @@ class TreeEmbedding:
             emb = self.model.transform(X)
 
         elif self.tree_model in ['XGBoost_approx', 'XGBoost_hist']:
-            # Clean infs and values too large (crashes)
-            X = self._handle_inf_and_value_too_large(X)
-            n_rows = len(X)
-            padding_rows = (-n_rows) % 128
-            if self._is_gpu_device() and padding_rows:
-                # Fill the final GPU block so XGBoost initializes every missing-value slot.
-                X = pd.concat([X, X.iloc[[0] * padding_rows]], ignore_index=True)
-            dtest = self._make_xgboost_dmatrix(X)
-            predict_kwargs = {}
-            if self.select_best_model:
-                best_iteration = getattr(self.model, 'best_iteration', None)
-                if best_iteration is not None:
-                    predict_kwargs['iteration_range'] = (0, int(best_iteration) + 1)
-            emb = self.model.predict(dtest, pred_leaf=True, **predict_kwargs)[:n_rows]
+            emb = self._xgboost_leaf_ids(X)
 
         elif self.tree_model == 'CatBoost':
             X = preprocess_cat_features_for_catboost(X, self.cat_features)
@@ -888,8 +931,10 @@ class TreeEmbedding:
         logger.info(f"Transforming data using tree model: {self.tree_model}")
         
         # Handle categorical features
-        X_encoded = pd.DataFrame(X.copy())
-        X_encoded = self._handle_categorical_features(X_encoded, fit=False)
+        if getattr(self, "_sparse_leaf_layout", None) is not None and not self.cat_features:
+            X_encoded = pd.DataFrame(X, copy=False)
+        else:
+            X_encoded = self._handle_categorical_features(X, fit=False)
 
         # Get embeddings
         emb = self._get_embeddings(X_encoded)
