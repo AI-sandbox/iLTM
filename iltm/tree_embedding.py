@@ -762,7 +762,6 @@ class TreeEmbedding:
                     leaf_kwargs['ntree_end'] = int(best_iteration) + 1
             emb = self.model.calc_leaf_indexes(test_pool, thread_count=self.n_jobs, **leaf_kwargs)
             del test_pool
-            gc.collect()
 
         else:
             raise ValueError(f"Unknown tree-based model: {self.tree_model}")
