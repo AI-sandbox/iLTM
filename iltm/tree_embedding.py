@@ -47,6 +47,7 @@ def _catboost_importance_threads(model, n_jobs):
 
 class TreeEmbedding:
     n_jobs = -1  # Also the default for older serialized trees.
+    _leaf_lookup = None
 
     def __init__(
         self,
@@ -922,6 +923,7 @@ class TreeEmbedding:
         self.n_orig_features_to_keep_ = None
         self.orig_feature_indices_to_keep_ = None
         self.onehot_top_features_idx_ = None
+        self._leaf_lookup = None
 
         # Handle categorical features
         X_encoded = self._handle_categorical_features(X, fit=True)
@@ -985,8 +987,63 @@ class TreeEmbedding:
                 # Select the top features
                 self.onehot_top_features_idx_ = sorted_feature_indices[:top_k_embeddings]
 
+            self._leaf_lookup = self._build_leaf_lookup()
+
         logger.info(f"Tree model {self.tree_model} fitted successfully")
         return emb
+
+    def _build_leaf_lookup(self):
+        """Map each tree's leaf IDs directly to the retained one-hot columns."""
+        categories = self.onehot_encoder.categories_
+        leaves = np.concatenate(categories)
+        if leaves.dtype.kind not in "iuf" or not np.isfinite(leaves).all() or leaves.min() < 0:
+            return None
+        width = int(leaves.max()) + 1
+        # For widely spaced IDs, the fitted encoder uses less memory.
+        entries = len(categories) * width
+        if entries > 16 * leaves.size or entries * np.dtype(np.int32).itemsize > _DENSE_ONEHOT_WORKING_SET_BYTES:
+            return None
+        leaf_ids = leaves.astype(np.intp, copy=False)
+        if leaves.dtype.kind == "f" and not np.array_equal(leaves, leaf_ids):
+            return None
+
+        selected = self.onehot_top_features_idx_
+        if selected is None:
+            columns = np.arange(leaves.size, dtype=np.int32)
+            n_columns = leaves.size
+        else:
+            columns = np.full(leaves.size, -1, dtype=np.int32)
+            columns[selected] = np.arange(len(selected), dtype=np.int32)
+            n_columns = len(selected)
+        lookup = np.full((len(categories), width), -1, dtype=np.int32)
+        offset = 0
+        for tree, values in enumerate(categories):
+            end = offset + len(values)
+            lookup[tree, leaf_ids[offset:end]] = columns[offset:end]
+            offset = end
+        return lookup, n_columns
+
+    def _encode_leaf_ids(self, emb):
+        lookup, n_columns = self._leaf_lookup
+        if (
+            emb.ndim != 2 or emb.shape[1] != len(lookup) or not len(emb)
+            or emb.dtype != self.onehot_encoder.categories_[0].dtype
+        ):
+            return None
+        # Dense column selection in numpy produces a Fortran-ordered array.
+        order = "F" if self.onehot_max_features and not self.onehot_encoder.sparse_output else "C"
+        out = np.zeros((len(emb), n_columns), dtype=np.int8, order=order)
+        tree_ids = np.arange(len(lookup))
+        batch_size = max(1, 131072 // len(lookup))
+        for start in range(0, len(emb), batch_size):
+            block = emb[start:start + batch_size]
+            if block.dtype.kind == "f" and not np.isfinite(block).all():
+                return None
+            ids = np.clip(block, 0, lookup.shape[1] - 1).astype(np.intp, copy=False)
+            columns = lookup[tree_ids, ids]
+            rows, trees = np.nonzero((columns >= 0) & (block == ids))
+            out[start + rows, columns[rows, trees]] = 1
+        return out
 
     def transform(self, X: pd.DataFrame | np.ndarray, onehot_encode: bool = True) -> np.ndarray:
         """
@@ -1016,9 +1073,12 @@ class TreeEmbedding:
 
     def _encode_embeddings(self, emb: np.ndarray, onehot_encode: bool = True) -> np.ndarray:
         if onehot_encode and self.tree_model != 'RT':
-            # Transform embeddings using OneHotEncoder
             assert self.onehot_encoder is not None, "Model not fitted. Call fit_tree() first."
             logger.debug(f"One-hot transforming leaves: emb.shape={emb.shape}, dtype={emb.dtype}")
+            if self._leaf_lookup is not None and self.onehot_max_features == (self.onehot_top_features_idx_ is not None):
+                encoded = self._encode_leaf_ids(emb)
+                if encoded is not None:
+                    return encoded
             emb_oh = self.onehot_encoder.transform(emb)
             logger.debug(f"Embedding shape: {emb.shape}, after one-hot encoding: {emb_oh.shape}")
 

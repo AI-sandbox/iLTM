@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import pickle
+
 import numpy as np
 import pandas as pd
+import pytest
 from sklearn.preprocessing import OneHotEncoder
 
 from iltm.tree_embedding import TreeEmbedding
@@ -122,3 +125,73 @@ def test_top_feature_encoding_stays_dense_when_pruning_is_unnecessary(
     )
     expected_order = np.argsort(expected_full.sum(axis=0))[::-1]
     np.testing.assert_array_equal(actual, expected_full[:, expected_order])
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.uint32, np.int64])
+@pytest.mark.parametrize("capped,sparse", [(False, False), (True, False), (True, True)])
+def test_leaf_lookup_matches_encoder_across_batches(monkeypatch, dtype, capped, sparse):
+    rng = np.random.default_rng(42)
+    leaves = (rng.integers(0, 8, size=(40, 70)) * 2).astype(dtype)
+    query = np.tile(leaves, (50, 1))
+    query[::3, 0] = 5  # An unseen leaf between two known IDs.
+    query[::4, -1] = 22
+    if dtype != np.uint32:
+        query[::5, 1] = -1
+    if dtype == np.float32:
+        query[::6, 2] = 2.5
+    monkeypatch.setattr("iltm.tree_embedding._DENSE_ONEHOT_WORKING_SET_BYTES", 12_000 if sparse else 64 * 1024**2)
+    X = pd.DataFrame({"x": np.arange(len(leaves))})
+    tree = TreeEmbedding("GB", [], "regression", onehot_max_features=capped)
+    monkeypatch.setattr(tree, "_fit_model", lambda *args: None)
+    monkeypatch.setattr(tree, "_get_embeddings", lambda X: leaves)
+    tree.fit_tree(X, X.x.to_numpy())
+    assert tree._leaf_lookup is not None
+    assert tree.onehot_encoder.sparse_output == sparse
+    expected = tree.onehot_encoder.transform(query)
+    if capped:
+        expected = expected[:, tree.onehot_top_features_idx_]
+    if sparse:
+        expected = expected.toarray()
+
+    def unexpected_transform(*args):
+        pytest.fail("Compact leaf IDs should use the lookup")
+
+    monkeypatch.setattr(tree.onehot_encoder, "transform", unexpected_transform)
+    actual = tree._encode_embeddings(query)
+    np.testing.assert_array_equal(actual, expected)
+    assert actual.dtype == expected.dtype
+    assert actual.strides == expected.strides
+
+
+def test_leaf_lookup_refit_and_encoder_fallback(monkeypatch):
+    tree = TreeEmbedding("GB", [], "regression")
+    X = pd.DataFrame({"x": [1, 2, 3]})
+    leaves = np.array([[0, 1], [1, 0], [1, 1]], dtype=np.float32)
+    monkeypatch.setattr(tree, "_fit_model", lambda *args: None)
+    monkeypatch.setattr(tree, "_get_embeddings", lambda X: leaves)
+    tree.fit_tree(X, X.x.to_numpy())
+    assert tree._leaf_lookup is not None
+    query = np.array([[np.nan, 1]], dtype=leaves.dtype)
+    np.testing.assert_array_equal(tree._encode_embeddings(query), tree.onehot_encoder.transform(query))
+    with pytest.raises(ValueError):
+        tree._encode_embeddings(np.array([[np.inf, 1]], dtype=leaves.dtype))
+    for query in (leaves[:, :1], leaves[:0]):
+        with pytest.raises(ValueError):
+            tree._encode_embeddings(query)
+
+    leaves[0, 0] = 1_000_000
+    tree.fit_tree(X, X.x.to_numpy())
+    assert tree._leaf_lookup is None
+    np.testing.assert_array_equal(tree._encode_embeddings(leaves), tree.onehot_encoder.transform(leaves))
+
+
+def test_leaf_lookup_serialization_and_older_tree():
+    tree = TreeEmbedding("GB", [], "regression", n_estimators=3, select_best_model=False, device="cpu")
+    X = pd.DataFrame({"x": np.arange(30, dtype=float)})
+    tree.fit_tree(X, X.x.to_numpy())
+    leaves = tree.transform(X, onehot_encode=False)
+    expected = tree.onehot_encoder.transform(leaves)
+    assert tree._leaf_lookup is not None
+    np.testing.assert_array_equal(pickle.loads(pickle.dumps(tree)).transform(X), expected)
+    del tree._leaf_lookup
+    np.testing.assert_array_equal(pickle.loads(pickle.dumps(tree)).transform(X), expected)
