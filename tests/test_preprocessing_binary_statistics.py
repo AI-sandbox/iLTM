@@ -90,3 +90,32 @@ def test_mixed_binary_and_continuous_statistics_match_reference(order):
     X[:, 3] = np.nan
     X[::11, 4] = np.nan
     _assert_matches_reference(np.array(X, order=order))
+
+
+@pytest.mark.parametrize("dtype", [np.float16, np.float32, np.float64, np.int32, np.uint16])
+@pytest.mark.parametrize("n_rows", [1, 17, 214, 601])
+def test_finite_nonbinary_statistics_match_reference(dtype, n_rows):
+    rng = np.random.default_rng(42)
+    X = rng.uniform(0, 20, size=(n_rows, 10)).astype(dtype)
+    X[:, 0] = 3
+    X[:, 1] = rng.integers(0, 2, size=n_rows)
+    _assert_matches_reference(X[:, ::-1])
+
+
+@pytest.mark.parametrize("dtype", [np.float16, np.float32, np.float64])
+@pytest.mark.parametrize("value", ["maximum", "nan", "inf", "-inf"])
+def test_extreme_and_nonfinite_statistics_match_reference(dtype, value):
+    extreme = np.finfo(dtype).max if value == "maximum" else float(value)
+    X = np.array([[extreme, -2], [extreme, 0], [extreme, 3]], dtype=dtype)
+    _assert_matches_reference(X)
+
+
+@pytest.mark.parametrize("dtype", [np.int32, np.float32])
+def test_masked_medians_match_nanmedian(dtype):
+    X = np.ma.array(
+        [[1, 10], [3, 100], [9, 4], [12, -110], [16, 0]],
+        dtype=dtype,
+        mask=[[False, False], [True, True], [False, False], [False, True], [False, False]],
+    )
+    transform = RobustScaleSmoothClipTransform().fit(X)
+    np.testing.assert_array_equal(transform._median, np.nanmedian(X, axis=0))

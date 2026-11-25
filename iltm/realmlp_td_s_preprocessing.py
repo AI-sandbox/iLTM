@@ -280,7 +280,13 @@ class RobustScaleSmoothClipTransform(BaseEstimator, TransformerMixin):
         nonbinary = ~is_binary
         if np.any(nonbinary):
             X_nonbinary = X[:, nonbinary]
-            med[nonbinary] = np.nanmedian(X_nonbinary, axis=-2)
+            use_plain_stats = X_nonbinary.size > 0 and type(X_nonbinary) is np.ndarray and X.dtype.kind in "iuf"
+            if use_plain_stats and X.dtype.kind == "f":
+                # nanmedian can overflow when it adds the two middle values, even on an odd-length axis.
+                limit = np.finfo(X.dtype).max / 2
+                use_plain_stats = X_nonbinary.min() >= -limit and X_nonbinary.max() <= limit
+            median = np.median if use_plain_stats else np.nanmedian
+            med[nonbinary] = median(X_nonbinary, axis=-2)
             if X.shape[0] == 0:
                 q75[nonbinary] = np.nanquantile(
                     X_nonbinary,
@@ -293,7 +299,8 @@ class RobustScaleSmoothClipTransform(BaseEstimator, TransformerMixin):
                     axis=-2,
                 )
             else:
-                quantiles = np.nanquantile(
+                quantile = np.quantile if use_plain_stats else np.nanquantile
+                quantiles = quantile(
                     X_nonbinary,
                     [0.25, 0.75],
                     axis=-2,
