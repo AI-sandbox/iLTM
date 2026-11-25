@@ -2182,8 +2182,11 @@ class _iLTMBase(BaseEstimator):
         tree_models = [
             cfg["tree_model"] if cfg["tree_embedding"] else None for cfg in self._checkpoint_mix_configs
         ] or [self.tree_model if self.tree_embedding else None]
-        xgb_members = [i for i in range(self.n_ensemble) if tree_models[i % len(tree_models)] == "XGBoost_hist"]
+        member_models = [tree_models[i % len(tree_models)] for i in range(self.n_ensemble)]
+        xgb_members = [i for i, model in enumerate(member_models) if model == "XGBoost_hist"]
+        catboost_members = [i for i, model in enumerate(member_models) if model == "CatBoost"]
         xgb_fit_cache = {}
+        catboost_fit_cache = {}
 
         # Generate predictors
         for i in range(self.n_ensemble):
@@ -2216,8 +2219,9 @@ class _iLTMBase(BaseEstimator):
                         break
 
             stop_for_memory, memory_details = self._should_stop_for_cpu_memory_before_predictor(i + 1)
-            if stop_for_memory and xgb_fit_cache:
+            if stop_for_memory and (xgb_fit_cache or catboost_fit_cache):
                 xgb_fit_cache.clear()
+                catboost_fit_cache.clear()
                 stop_for_memory, memory_details = self._should_stop_for_cpu_memory_before_predictor(i + 1)
             if stop_for_memory and memory_details is not None:
                 logger.warning(
@@ -2287,16 +2291,21 @@ class _iLTMBase(BaseEstimator):
                     if fit_deadline_reached(fit_deadline):
                         break
                     if X_tree is X_for_nn and hasattr(tree, "_fit_transform_training"):
-                        reuse_xgb = (
-                            len(xgb_members) > 1 and i in xgb_members and X_tree is X_original and y_tree is y_proc
-                        )
+                        fit_caches = {}
+                        if X_tree is X_original and y_tree is y_proc:
+                            if len(xgb_members) > 1 and i in xgb_members:
+                                fit_caches["xgb_fit_cache"] = xgb_fit_cache
+                            elif len(catboost_members) > 1 and i in catboost_members:
+                                fit_caches["catboost_fit_cache"] = catboost_fit_cache
                         X_emb_tr = tree._fit_transform_training(
                             X_tree,
                             y_tree,
                             eval_set=tree_eval_set,
                             concat_with_orig_features=predictor_concat,
-                            xgb_fit_cache=xgb_fit_cache if reuse_xgb else None,
+                            **fit_caches,
                         )
+                        if catboost_fit_cache and i == catboost_members[-1]:
+                            catboost_fit_cache.clear()
                         if xgb_fit_cache and (
                             i == xgb_members[-1]
                             or (

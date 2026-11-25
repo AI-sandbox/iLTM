@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 _DENSE_ONEHOT_WORKING_SET_BYTES = 64 * 1024**2
 _XGBoostFitCache = dict[tuple, tuple[xgb.DMatrix, xgb.DMatrix | None, pd.DataFrame]]
+_CatBoostFitCache = dict[tuple, tuple[Pool, Pool | None]]
 
 
 @contextmanager
@@ -345,6 +346,7 @@ class TreeEmbedding:
     def _fit_model(
         self, X: pd.DataFrame, y: np.ndarray | pd.Series, eval_set: tuple = None,
         *, xgb_fit_cache: _XGBoostFitCache | None = None,
+        catboost_fit_cache: _CatBoostFitCache | None = None,
     ) -> None:
         """
         Fits the tree-based model based on the specified type.
@@ -566,10 +568,12 @@ class TreeEmbedding:
                 else: # device is 'cpu'
                     catboost_params['rsm'] = self.feature_fraction
 
+            small = len(X) <= 1024
+            wide = X.shape[1] >= 10_000
             if (
                 catboost_params['task_type'] == 'GPU'
-                and len(X) <= 1024
-                and (self.cat_features or X.shape[1] >= 10_000)
+                and small
+                and (self.cat_features or wide)
             ):
                 catboost_params['task_type'] = 'CPU'
                 catboost_params.pop('devices', None)
@@ -599,13 +603,9 @@ class TreeEmbedding:
             else:
                 ctor = CatBoostClassifier
 
-            X_prep = preprocess_cat_features_for_catboost(X, self.cat_features)
-            train_pool = Pool(X_prep, label=y, cat_features=self.cat_features, thread_count=self.n_jobs)
-            if X_val is not None:
-                X_val_prep = preprocess_cat_features_for_catboost(X_val, self.cat_features)
-                eval_pool = Pool(X_val_prep, label=y_val, cat_features=self.cat_features, thread_count=self.n_jobs)
-            else:
-                eval_pool = None
+            if not (small and wide) or (self.select_best_model and eval_set is None):
+                catboost_fit_cache = None
+            train_pool, eval_pool = self._catboost_fit_pools(X, y, X_val, y_val, catboost_fit_cache)
 
             max_attempts = 16
             iters = int(catboost_params.get('iterations', 100))
@@ -632,6 +632,8 @@ class TreeEmbedding:
                     if not is_cuda_oom(e):
                         raise
                     logger.warning("CatBoost OOM on attempt %d. Adapting and retrying.", attempt)
+                    if catboost_fit_cache is not None:
+                        catboost_fit_cache.clear()
                     clear_cuda_cache()
                     if attempt == max_attempts:
                         raise
@@ -672,6 +674,24 @@ class TreeEmbedding:
             self._catboost_leaf_layout = self._catboost_used_columns(X)
         else:
             raise ValueError(f"Unknown tree-based model: {self.tree_model}")
+
+    def _catboost_fit_pools(self, X, y, X_val, y_val, cache):
+        # Feature selection also reads the prepared categorical columns from X.
+        X_prep = preprocess_cat_features_for_catboost(X, self.cat_features)
+        if cache is not None:
+            key = (tuple(self.cat_features or ()), self.n_jobs, X_val is not None)
+            if key in cache:
+                return cache[key]
+            cache.clear()
+
+        train_pool = Pool(X_prep, label=y, cat_features=self.cat_features, thread_count=self.n_jobs)
+        eval_pool = None
+        if X_val is not None:
+            X_val_prep = preprocess_cat_features_for_catboost(X_val, self.cat_features)
+            eval_pool = Pool(X_val_prep, label=y_val, cat_features=self.cat_features, thread_count=self.n_jobs)
+        if cache is not None:
+            cache[key] = train_pool, eval_pool
+        return train_pool, eval_pool
 
     def _catboost_used_columns(self, X: pd.DataFrame) -> tuple[pd.Index, np.ndarray] | None:
         if X.shape[1] < 256 or isinstance(X.columns, pd.MultiIndex):
@@ -873,8 +893,7 @@ class TreeEmbedding:
         y: np.ndarray,
         eval_set: tuple = None,
         concat_with_orig_features: bool = True,
-        *,
-        xgb_fit_cache: _XGBoostFitCache | None = None,
+        **fit_caches,
     ) -> np.ndarray:
         if (
             getattr(self.fit_tree, "__func__", None) is not _TREE_EMBEDDING_FIT_TREE
@@ -887,7 +906,7 @@ class TreeEmbedding:
                 concat_with_orig_features=concat_with_orig_features,
             )
             return self.transform(X)
-        embeddings = self._fit_tree(X, y, eval_set, concat_with_orig_features, xgb_fit_cache=xgb_fit_cache)
+        embeddings = self._fit_tree(X, y, eval_set, concat_with_orig_features, **fit_caches)
         return self._encode_embeddings(embeddings)
 
     def _fit_tree(
@@ -896,8 +915,7 @@ class TreeEmbedding:
         y: np.ndarray,
         eval_set: tuple = None,
         concat_with_orig_features: bool = True,
-        *,
-        xgb_fit_cache: _XGBoostFitCache | None = None,
+        **fit_caches,
     ) -> np.ndarray:
         """Fit the tree and encoder, returning the training leaf matrix."""
         logger.info(f"Fitting tree model: {self.tree_model}")
@@ -909,10 +927,7 @@ class TreeEmbedding:
         X_encoded = self._handle_categorical_features(X, fit=True)
 
         # Fit the tree-based model
-        if xgb_fit_cache is None:
-            self._fit_model(X_encoded, y, eval_set)
-        else:
-            self._fit_model(X_encoded, y, eval_set, xgb_fit_cache=xgb_fit_cache)
+        self._fit_model(X_encoded, y, eval_set, **fit_caches)
 
         # Get embeddings
         emb = self._get_embeddings(X_encoded)
